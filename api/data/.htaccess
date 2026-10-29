@@ -1,0 +1,9 @@
+# Protection du dossier data/ (base SQLite + médias privés).
+# Les médias sont servis uniquement par api-messagerie.php?action=media_get.
+<IfModule mod_authz_core.c>
+  Require all denied
+</IfModule>
+<IfModule !mod_authz_core.c>
+  Order allow,deny
+  Deny from all
+</IfModule>

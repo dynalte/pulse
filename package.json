@@ -1,0 +1,35 @@
+{
+  "name": "messagerie-ionic",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Messagerie moderne type WhatsApp — Ionic React PWA + API PHP SQLite",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "api": "php -S 127.0.0.1:8110 -t api api/router.php",
+    "icons": "sh scripts/make-icons.sh",
+    "deploy:web": "npm run build && ssh root@photos2.dynaspirit.com 'mkdir -p /srv/web/photos/pulse' && scp -r dist/* root@photos2.dynaspirit.com:/srv/web/photos/pulse/",
+    "deploy:api": "scp api/api-messagerie.php root@photos2.dynaspirit.com:/srv/web/photos/api-messagerie.php && scp scripts/reset-password.php root@photos2.dynaspirit.com:/srv/web/photos/pulse-reset.php",
+    "deploy": "npm run deploy:web && npm run deploy:api"
+  },
+  "dependencies": {
+    "@ionic/react": "^8.5.0",
+    "@ionic/react-router": "^8.5.0",
+    "ionicons": "^7.4.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "react-router-dom": "^5.3.4"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@types/react-router-dom": "^5.3.3",
+    "@vitejs/plugin-react": "^4.3.4",
+    "playwright": "^1.64.1",
+    "typescript": "^5.6.3",
+    "vite": "^6.0.3",
+    "vite-plugin-pwa": "^1.3.0"
+  }
+}
