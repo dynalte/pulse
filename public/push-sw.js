@@ -24,10 +24,16 @@ self.addEventListener('push', (event) => {
     actions: [{ action: 'open', title: 'Ouvrir' }],
   };
   event.waitUntil((async () => {
-    // Ne pas doubler les notifications si l'app est déjà au premier plan :
-    // le client affiche alors son propre toast et joue le son.
+    // Ne pas doubler les notifications si l'app est réellement visible :
+    // le client affiche alors son propre bandeau et joue le son. On teste la
+    // visibilité de l'onglet (et non le focus de la fenêtre), sinon un onglet
+    // Pulse en arrière-plan dans une fenêtre Chrome active bloquait tout.
     const clientList = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
-    if (clientList.some((c) => c.focused) && data.tag !== 'pulse-test') return;
+    const appVisible = clientList.some((c) => {
+      const state = c.visibilityState;
+      return typeof state === 'string' ? state === 'visible' : !!c.focused;
+    });
+    if (appVisible && data.tag !== 'pulse-test') return;
     await self.registration.showNotification(title, options);
   })());
 });

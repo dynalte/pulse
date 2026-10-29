@@ -6,7 +6,7 @@ import {
   personOutline, shieldCheckmarkOutline, colorPaletteOutline, lockClosedOutline, serverOutline,
   informationCircleOutline, peopleOutline, mailOutline, powerOutline, refreshOutline,
   addOutline, statsChartOutline, chatbubblesOutline, imageOutline, pencilOutline,
-  phonePortraitOutline, trashOutline,
+  phonePortraitOutline, paperPlaneOutline, trashOutline,
 } from 'ionicons/icons';
 import { accountApi, adminApi, pushApi, uploadMedia } from '../services/api';
 import type { PushDevice } from '../services/api';
@@ -42,6 +42,7 @@ export default function SettingsPage() {
   const [subscriptionActive, setSubscriptionActive] = useState(false);
   const [pushChecked, setPushChecked] = useState(false);
   const [pushDevices, setPushDevices] = useState<PushDevice[]>([]);
+  const [deviceBusy, setDeviceBusy] = useState<number | null>(null);
   const [showPassword, setShowPassword] = useState(false);
   const [passwords, setPasswords] = useState({ current: '', next: '', confirm: '' });
   const [passwordBusy, setPasswordBusy] = useState(false);
@@ -209,8 +210,20 @@ export default function SettingsPage() {
     try {
       const res = await testPush();
       toast({ title: res.ok ? 'Notification envoyée' : 'Envoi impossible', body: res.message, tone: res.ok ? 'success' : 'error' });
+      await loadPushDevices();
     } finally {
       setPushBusy(false);
+    }
+  };
+
+  const testPushDevice = async (device: PushDevice) => {
+    setDeviceBusy(device.id);
+    try {
+      const res = await testPush(device.id);
+      toast({ title: res.ok ? 'Test envoyé' : 'Test impossible', body: res.message, tone: res.ok ? 'success' : 'error' });
+      await loadPushDevices();
+    } finally {
+      setDeviceBusy(null);
     }
   };
 
@@ -408,11 +421,22 @@ export default function SettingsPage() {
                     Ajouté le {new Date(d.createdAt * 1000).toLocaleDateString('fr-FR')}
                     {d.lastOk ? ` · dernière notification ${formatListTime(d.lastOk)}` : ' · aucune notification reçue'}
                   </span>
+                  {d.error && <span className="push-device-error">Erreur : {d.error}</span>}
                 </div>
+                <button
+                  type="button"
+                  className="icon-btn"
+                  onClick={() => void testPushDevice(d)}
+                  disabled={pushBusy || deviceBusy !== null}
+                  aria-label={`Tester ${describeDevice(d.ua)}`}
+                  title="Envoyer une notification de test à cet appareil"
+                >
+                  {deviceBusy === d.id ? <Spinner size={14} /> : <IonIcon icon={paperPlaneOutline} />}
+                </button>
                 {!d.current && (
                   <button
                     type="button"
-                    className="icon-btn"
+                    className="icon-btn danger"
                     onClick={() => void removePushDevice(d)}
                     disabled={pushBusy}
                     aria-label={`Retirer ${describeDevice(d.ua)}`}
@@ -423,6 +447,10 @@ export default function SettingsPage() {
                 )}
               </div>
             ))}
+            <p className="push-device-hint">
+              Sur macOS, vérifiez aussi que Chrome est autorisé dans Réglages Système → Notifications.
+              Les notifications système sont masquées quand Pulse est au premier plan (un bandeau s’affiche à la place).
+            </p>
           </div>
         )}
         {pushEnabled && (

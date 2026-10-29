@@ -105,10 +105,12 @@ export async function disablePush(): Promise<void> {  if (!pushSupported()) retu
   }
 }
 
-export async function testPush(): Promise<{ ok: boolean; message: string }> {
+export async function testPush(id?: number): Promise<{ ok: boolean; message: string }> {
   try {
-    const r = await pushApi.test();
-    if (r.sent > 0) return { ok: true, message: 'Notification de test envoyée.' };
+    const r = await pushApi.test(id);
+    if (r.sent > 0) {
+      return { ok: true, message: id ? 'Notification de test envoyée à cet appareil. Si rien ne s’affiche, vérifiez les autorisations du navigateur et du système.' : 'Notification de test envoyée.' };
+    }
     return { ok: false, message: r.error || 'Aucun appareil abonné. Activez d’abord les notifications.' };
   } catch (e) {
     return { ok: false, message: (e as Error).message };

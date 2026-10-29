@@ -3118,24 +3118,45 @@ function push_devices_action(array $user): void
 
 function push_test_action(array $user): void
 {
+    $testPayload = [
+        'title' => 'Pulse',
+        'body' => 'Les notifications fonctionnent ! 🎉',
+        'url' => '#/',
+        'tag' => 'pulse-test',
+        'sound' => true,
+    ];
+    // Test ciblé d'un appareil (diagnostic depuis la liste des appareils).
+    $id = (int)p('id', 0);
+    if ($id > 0) {
+        $st = db()->prepare('SELECT * FROM push_subscriptions WHERE id = ? AND user_id = ?');
+        $st->execute([$id, (int)$user['id']]);
+        $sub = $st->fetch();
+        if (!$sub) fail('Appareil introuvable.', 404);
+        [$sent, $status, $err] = webpush_send($sub, $testPayload);
+        ok([
+            'sent' => $sent ? 1 : 0,
+            'status' => $status,
+            'error' => $sent ? '' : trim($status . ' ' . ($err !== '' ? $err : 'Échec de l’envoi.')),
+        ]);
+    }
     $st = db()->prepare('SELECT * FROM push_subscriptions WHERE user_id = ?');
     $st->execute([(int)$user['id']]);
     $subs = $st->fetchAll();
-    if (!$subs) ok(['sent' => 0, 'error' => 'Aucun appareil abonné.']);
+    if (!$subs) ok(['sent' => 0, 'error' => 'Aucun appareil abonné.', 'results' => []]);
     $sent = 0;
     $errors = [];
+    $results = [];
     foreach ($subs as $sub) {
-        [$ok, $status, $err] = webpush_send($sub, [
-            'title' => 'Pulse',
-            'body' => 'Les notifications fonctionnent ! 🎉',
-            'url' => '#/',
-            'tag' => 'pulse-test',
-            'sound' => true,
-        ]);
+        [$ok, $status, $err] = webpush_send($sub, $testPayload);
         if ($ok) $sent++;
         else $errors[] = $status . ' ' . $err;
+        $results[] = ['id' => (int)$sub['id'], 'ok' => $ok, 'status' => $status, 'error' => $ok ? '' : (string)$err];
     }
-    ok(['sent' => $sent, 'error' => $sent === 0 ? (implode(' · ', array_slice($errors, 0, 2)) ?: 'Échec de l’envoi.') : '']);
+    ok([
+        'sent' => $sent,
+        'error' => $sent === 0 ? (implode(' · ', array_slice($errors, 0, 2)) ?: 'Échec de l’envoi.') : '',
+        'results' => $results,
+    ]);
 }
 
 // ============================== ADMIN ==============================
