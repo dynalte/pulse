@@ -690,6 +690,7 @@ export default function ChatPage() {
       )}
 
       <div className="messages" ref={scrollRef} onScroll={onScroll}>
+        <div className="messages-fill" aria-hidden="true" />
         {hasMore && (
           <div className="load-older">
             <button type="button" className="btn small ghost" onClick={() => void loadOlder()} disabled={loadingOlder}>
