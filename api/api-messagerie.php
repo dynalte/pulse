@@ -1583,6 +1583,8 @@ try {
                 push_subscribe_action($user);
             case 'push_unsubscribe':
                 push_unsubscribe_action($user);
+            case 'push_devices':
+                push_devices_action($user);
             case 'push_test':
                 push_test_action($user);
 
@@ -3076,11 +3078,42 @@ function push_subscribe_action(array $user): void
 
 function push_unsubscribe_action(array $user): void
 {
-    $endpoint = str_input('endpoint', 2048);
-    if ($endpoint !== '') {
-        db()->prepare('DELETE FROM push_subscriptions WHERE endpoint = ? AND user_id = ?')->execute([$endpoint, (int)$user['id']]);
+    $id = (int)p('id', 0);
+    if ($id > 0) {
+        // Suppression d'un autre appareil du même compte (jamais celui d'un autre utilisateur).
+        db()->prepare('DELETE FROM push_subscriptions WHERE id = ? AND user_id = ?')->execute([$id, (int)$user['id']]);
+    } else {
+        $endpoint = str_input('endpoint', 2048);
+        if ($endpoint !== '') {
+            db()->prepare('DELETE FROM push_subscriptions WHERE endpoint = ? AND user_id = ?')->execute([$endpoint, (int)$user['id']]);
+        }
     }
-    ok();
+    $st = db()->prepare('SELECT COUNT(*) FROM push_subscriptions WHERE user_id = ?');
+    $st->execute([(int)$user['id']]);
+    ok(['devices' => (int)$st->fetchColumn()]);
+}
+
+function push_devices_action(array $user): void
+{
+    // L'endpoint complet n'est jamais renvoyé : seul un marqueur « cet appareil »
+    // est calculé à partir de l'endpoint transmis par le client.
+    $current = str_input('endpoint', 2048);
+    $currentHash = $current !== '' ? hash('sha256', $current) : '';
+    $st = db()->prepare('SELECT id, endpoint, ua, created_at, last_ok, last_error FROM push_subscriptions WHERE user_id = ? ORDER BY created_at ASC');
+    $st->execute([(int)$user['id']]);
+    $devices = [];
+    foreach ($st->fetchAll() as $row) {
+        $hash = hash('sha256', (string)$row['endpoint']);
+        $devices[] = [
+            'id' => (int)$row['id'],
+            'ua' => (string)$row['ua'],
+            'createdAt' => (int)$row['created_at'],
+            'lastOk' => (int)$row['last_ok'],
+            'error' => (string)$row['last_error'],
+            'current' => $currentHash !== '' && hash_equals($currentHash, $hash),
+        ];
+    }
+    ok(['devices' => $devices]);
 }
 
 function push_test_action(array $user): void

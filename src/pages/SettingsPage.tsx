@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useHistory } from 'react-router-dom';
 import { IonIcon } from '@ionic/react';
 import {
@@ -6,12 +6,16 @@ import {
   personOutline, shieldCheckmarkOutline, colorPaletteOutline, lockClosedOutline, serverOutline,
   informationCircleOutline, peopleOutline, mailOutline, powerOutline, refreshOutline,
   addOutline, statsChartOutline, chatbubblesOutline, imageOutline, pencilOutline,
+  phonePortraitOutline, trashOutline,
 } from 'ionicons/icons';
-import { accountApi, adminApi, uploadMedia } from '../services/api';
+import { accountApi, adminApi, pushApi, uploadMedia } from '../services/api';
+import type { PushDevice } from '../services/api';
 import { useApp } from '../context/AppContext';
 import { useInstallPrompt } from '../services/hooks';
 import { prepareImage } from '../services/image';
-import { disablePush, enablePush, pushSupported, testPush } from '../services/notifications';
+import {
+  currentPushEndpoint, describeDevice, disablePush, enablePush, pushSupported, testPush,
+} from '../services/notifications';
 import { setApiURL, settings } from '../services/settings';
 import { formatListTime, lastSeenLabel } from '../services/utils';
 import type { AdminStats, PrivacyValue, ThemeMode, User } from '../types';
@@ -37,6 +41,7 @@ export default function SettingsPage() {
   const [pushBusy, setPushBusy] = useState(false);
   const [subscriptionActive, setSubscriptionActive] = useState(false);
   const [pushChecked, setPushChecked] = useState(false);
+  const [pushDevices, setPushDevices] = useState<PushDevice[]>([]);
   const [showPassword, setShowPassword] = useState(false);
   const [passwords, setPasswords] = useState({ current: '', next: '', confirm: '' });
   const [passwordBusy, setPasswordBusy] = useState(false);
@@ -67,6 +72,18 @@ export default function SettingsPage() {
 
   // Un compte peut être activé sur plusieurs appareils : on vérifie
   // l'abonnement réel de CE navigateur, pas seulement la préférence serveur.
+  const loadPushDevices = useCallback(async () => {
+    if (!pushSupported()) return;
+    try {
+      const endpoint = await currentPushEndpoint();
+      const res = await pushApi.devices(endpoint);
+      setPushDevices(res.devices);
+      if (endpoint) setSubscriptionActive(res.devices.some((d) => d.current));
+    } catch {
+      /* liste indicative : on n'empêche pas l'écran de fonctionner */
+    }
+  }, []);
+
   useEffect(() => {
     let alive = true;
     let timer = 0;
@@ -82,6 +99,7 @@ export default function SettingsPage() {
         if (!alive) return;
         setSubscriptionActive(!!sub);
         setPushChecked(true);
+        void loadPushDevices();
         // L'abonnement automatique de connexion peut être encore en cours.
         if (!sub && attempts < 3) {
           attempts++;
@@ -101,7 +119,7 @@ export default function SettingsPage() {
       if (timer) window.clearTimeout(timer);
       document.removeEventListener('visibilitychange', onVisibility);
     };
-  }, [me?.id]);
+  }, [me?.id, loadPushDevices]);
 
   const filteredAdminUsers = useMemo(() => {
     const needle = adminQ.trim().toLowerCase();
@@ -149,22 +167,38 @@ export default function SettingsPage() {
     setPushBusy(true);
     try {
       if (pushEnabled) {
+        // Désactivation locale uniquement : les autres appareils du compte
+        // restent abonnés (la préférence globale reste activée).
         await disablePush();
-        await updateNotif({ enabled: false });
         setSubscriptionActive(false);
-        toast({ title: 'Notifications push désactivées', tone: 'success' });
+        toast({ title: 'Notifications désactivées sur cet appareil', tone: 'success' });
       } else {
         const res = await enablePush();
         if (!res.ok) {
           toast({ title: 'Activation impossible', body: res.reason, tone: 'error' });
         } else {
-          await updateNotif({ enabled: true });
+          if (!me.notif.enabled) await updateNotif({ enabled: true });
           setSubscriptionActive(true);
-          toast({ title: 'Notifications activées', tone: 'success' });
+          toast({ title: 'Notifications activées sur cet appareil', tone: 'success' });
         }
       }
       setPushPermission(typeof Notification !== 'undefined' ? Notification.permission : 'unsupported');
       await refreshMe();
+      await loadPushDevices();
+    } finally {
+      setPushBusy(false);
+    }
+  };
+
+  const removePushDevice = async (device: PushDevice) => {
+    setPushBusy(true);
+    try {
+      await pushApi.removeDevice(device.id);
+      toast({ title: 'Appareil retiré', body: 'Il ne recevra plus les notifications.', tone: 'success' });
+      await refreshMe();
+      await loadPushDevices();
+    } catch (e) {
+      toast({ title: 'Suppression impossible', body: (e as Error).message, tone: 'error' });
     } finally {
       setPushBusy(false);
     }
@@ -348,7 +382,7 @@ export default function SettingsPage() {
           <div>
             <strong>Notifications push</strong>
             <span>
-              {!pushChecked ? 'Vérification de l’abonnement…' : pushPermission === 'denied' ? 'Bloquées par le navigateur. Autorisez-les dans les réglages du site.' : pushEnabled ? 'Actives sur cet appareil.' : me.notif.enabled ? 'Autorisation accordée : activez les notifications sur cet appareil.' : 'Recevez les messages même app fermée.'}
+              {!pushChecked ? 'Vérification de l’abonnement…' : pushPermission === 'denied' ? 'Bloquées par le navigateur. Autorisez-les dans les réglages du site.' : pushEnabled ? 'Actives sur cet appareil.' : 'Non activées sur cet appareil. Les autres appareils du compte restent indépendants.'}
               {installed ? ' Application installée.' : ''}
             </span>
           </div>
@@ -357,6 +391,40 @@ export default function SettingsPage() {
             {pushEnabled ? 'Désactiver' : 'Activer'}
           </button>
         </div>
+        {pushDevices.length > 0 && (
+          <div className="push-devices">
+            <div className="push-devices-head">
+              Appareils abonnés <Tag tone="accent">{pushDevices.length}</Tag>
+            </div>
+            {pushDevices.map((d) => (
+              <div key={d.id} className={`push-device ${d.current ? 'current' : ''}`}>
+                <span className="push-device-icon"><IonIcon icon={phonePortraitOutline} /></span>
+                <div className="push-device-text">
+                  <strong>
+                    {describeDevice(d.ua)}
+                    {d.current && <Tag tone="accent">cet appareil</Tag>}
+                  </strong>
+                  <span>
+                    Ajouté le {new Date(d.createdAt * 1000).toLocaleDateString('fr-FR')}
+                    {d.lastOk ? ` · dernière notification ${formatListTime(d.lastOk)}` : ' · aucune notification reçue'}
+                  </span>
+                </div>
+                {!d.current && (
+                  <button
+                    type="button"
+                    className="icon-btn"
+                    onClick={() => void removePushDevice(d)}
+                    disabled={pushBusy}
+                    aria-label={`Retirer ${describeDevice(d.ua)}`}
+                    title="Retirer cet appareil"
+                  >
+                    <IonIcon icon={trashOutline} />
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
         {pushEnabled && (
           <div className="settings-line">
             <div><strong>Tester</strong><span>Envoie une notification à vos appareils abonnés.</span></div>

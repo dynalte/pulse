@@ -23,6 +23,42 @@ async function getRegistration(): Promise<ServiceWorkerRegistration> {
   return reg;
 }
 
+/** Endpoint de l'abonnement push de CE navigateur ('' si aucun). */
+export async function currentPushEndpoint(): Promise<string> {
+  if (!pushSupported()) return '';
+  try {
+    const reg = await getRegistration();
+    const sub = await reg.pushManager.getSubscription();
+    return sub?.endpoint || '';
+  } catch {
+    return '';
+  }
+}
+
+/** Libellé lisible d'un appareil à partir de son User-Agent. */
+export function describeDevice(ua: string): string {
+  const s = ua || '';
+  const platform =
+    /iPhone/i.test(s) ? 'iPhone'
+    : /iPad/i.test(s) ? 'iPad'
+    : /iPod/i.test(s) ? 'iPod'
+    : /Android/i.test(s) ? 'Android'
+    : /CrOS/i.test(s) ? 'Chromebook'
+    : /Macintosh|Mac OS X/i.test(s) ? 'Mac'
+    : /Windows/i.test(s) ? 'Windows'
+    : /Linux/i.test(s) ? 'Linux'
+    : 'Appareil inconnu';
+  const browser =
+    /Edg\//i.test(s) ? 'Edge'
+    : /OPR\//i.test(s) ? 'Opera'
+    : /SamsungBrowser/i.test(s) ? 'Samsung Internet'
+    : /Firefox|FxiOS/i.test(s) ? 'Firefox'
+    : /Chrome|CriOS/i.test(s) ? 'Chrome'
+    : /Safari/i.test(s) ? 'Safari'
+    : '';
+  return browser ? `${platform} · ${browser}` : platform;
+}
+
 export interface PushResult {
   ok: boolean;
   reason?: string;
@@ -56,8 +92,7 @@ export async function enablePush(): Promise<PushResult> {
   return { ok: true };
 }
 
-export async function disablePush(): Promise<void> {
-  if (!pushSupported()) return;
+export async function disablePush(): Promise<void> {  if (!pushSupported()) return;
   try {
     const reg = await getRegistration();
     const sub = await reg.pushManager.getSubscription();

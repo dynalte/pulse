@@ -224,11 +224,25 @@ export function uploadMedia(
 
 /* -------------------------------------------------------------------- push */
 
+export interface PushDevice {
+  id: number;
+  ua: string;
+  createdAt: number;
+  lastOk: number;
+  error: string;
+  current: boolean;
+}
+
 export const pushApi = {
   key: () => request<{ publicKey: string; enabled: boolean }>('push_key', { public: true }),
   subscribe: (subscription: PushSubscriptionJSON, userAgent: string) =>
     request<{ ok: true; devices: number; publicKey?: string }>('push_subscribe', { body: { subscription, userAgent } }),
-  unsubscribe: (endpoint: string) => request<{ ok: true }>('push_unsubscribe', { body: { endpoint } }),
+  unsubscribe: (endpoint: string) =>
+    request<{ ok: true; devices: number }>('push_unsubscribe', { body: { endpoint } }),
+  removeDevice: (id: number) =>
+    request<{ ok: true; devices: number }>('push_unsubscribe', { body: { id } }),
+  devices: (endpoint: string) =>
+    request<{ devices: PushDevice[] }>('push_devices', { body: { endpoint } }),
   test: () => request<{ ok: boolean; sent: number; error?: string }>('push_test', { body: {}, timeout: 20000 }),
 };
 
