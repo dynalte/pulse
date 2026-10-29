@@ -1432,6 +1432,16 @@ html[data-theme="light"] .bubble.theirs .file-card { background: var(--surface-2
   .auth-features { grid-template-columns: 1fr; }
 }
 
+/* iOS / iPadOS : Safari zoome automatiquement au focus d'un champ dont la
+   police est < 16px. On force 16px pour tous les champs sur ces plateformes. */
+@supports (-webkit-touch-callout: none) {
+  input, textarea, select,
+  .search-box input, .list-search input, .composer textarea,
+  .settings-line select, .inline-edit input, .inline-edit textarea {
+    font-size: 16px !important;
+  }
+}
+
 /* Réduction de mouvement */
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; scroll-behavior: auto !important; }
