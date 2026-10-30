@@ -1,7 +1,7 @@
 import React, { useEffect } from 'react';
 import { createPortal } from 'react-dom';
 import { useHistory } from 'react-router-dom';
-import { closeOutline } from 'ionicons/icons';
+import { closeOutline, peopleOutline } from 'ionicons/icons';
 import { IonIcon } from '@ionic/react';
 import { useApp } from '../context/AppContext';
 import { useMediaUrl } from '../services/media';
@@ -35,6 +35,7 @@ export function Avatar({ id = 0, name, avatarId, size = 44, online, group, class
   const url = useMediaUrl(avatarId);
   const [c1, c2] = avatarColors(group ? id + 3 : id || name.length);
   const fontSize = Math.max(11, Math.round(size * (initials(name).length > 1 ? 0.36 : 0.42)));
+  const badgeSize = Math.max(14, Math.round(size * 0.34));
   return (
     <span
       className={`avatar ${className} ${ring ? 'ring' : ''}`}
@@ -43,6 +44,11 @@ export function Avatar({ id = 0, name, avatarId, size = 44, online, group, class
     >
       {url ? <img src={url} alt="" /> : <span>{initials(name)}</span>}
       {online !== undefined && <i className={`presence ${online ? 'on' : ''}`} />}
+      {group && (
+        <i className="avatar-group-badge" style={{ width: badgeSize, height: badgeSize, fontSize: Math.max(8, Math.round(badgeSize * 0.6)) }}>
+          <IonIcon icon={peopleOutline} />
+        </i>
+      )}
     </span>
   );
 }
