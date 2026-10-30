@@ -4,8 +4,8 @@
  */
 import { settings } from './settings';
 import type {
-  AdminStats, Conversation, Invite, InviteInfo, Me, Media, MediaKind, Message,
-  SearchResults, SyncResponse, User, UserRole, NotifPrefs, PrivacyPrefs,
+  AdminStats, ContactRequest, Conversation, Invite, InviteInfo, LocationData, Me, Media, MediaKind,
+  Message, Poll, SearchResults, SyncResponse, User, UserRole, NotifPrefs, PrivacyPrefs,
 } from '../types';
 
 export class ApiError extends Error {
@@ -90,6 +90,27 @@ async function request<T>(action: string, opts: RequestOptions = {}): Promise<T>
   }
 }
 
+/**
+ * URL du flux SSE. EventSource n'accepte pas d'en-tête personnalisé :
+ * le jeton de session passe par `?session=`.
+ */
+export function syncStreamUrl(params: {
+  session: string;
+  since?: number;
+  conversationId?: number;
+  afterMessageId?: number;
+  updatesSince?: number;
+  presence?: number[];
+}): string {
+  const query = [`session=${encodeURIComponent(params.session)}`];
+  if (params.since) query.push(`since=${Math.floor(params.since)}`);
+  if (params.conversationId) query.push(`conversationId=${params.conversationId}`);
+  if (params.afterMessageId) query.push(`afterMessageId=${params.afterMessageId}`);
+  if (params.updatesSince) query.push(`updatesSince=${params.updatesSince}`);
+  if (params.presence?.length) query.push(`presence=${params.presence.join(',')}`);
+  return `${endpoint('stream')}&${query.join('&')}`;
+}
+
 /* ------------------------------------------------------------------ auth */
 
 export const authApi = {
@@ -115,6 +136,18 @@ export const accountApi = {
   }) => request<{ user: Me }>('profile_update', { body: p }),
   searchUsers: (q: string) => request<{ users: User[] }>('user_search', { body: { q } }),
   directory: () => request<{ users: User[] }>('directory', { body: {} }),
+  contacts: () => request<{ users: User[]; incoming: number }>('contacts_list', { body: {} }),
+  contactRequests: () => request<{ incoming: ContactRequest[]; outgoing: ContactRequest[] }>('contact_requests_list', { body: {} }),
+  requestContact: (userId: number) =>
+    request<{ status: string; requestId: number | null; user: User }>('contact_request', { body: { userId } }),
+  acceptContact: (requestId: number) =>
+    request<{ status: string; userId: number; user: User | null }>('contact_accept', { body: { requestId } }),
+  declineContact: (requestId: number) =>
+    request<{ ok: true }>('contact_decline', { body: { requestId } }),
+  cancelContact: (requestId: number) =>
+    request<{ ok: true }>('contact_cancel', { body: { requestId } }),
+  removeContact: (userId: number) =>
+    request<{ ok: true }>('contact_remove', { body: { userId } }),
   heartbeat: () => request<{ now: number }>('heartbeat', { body: {} }),
   changePassword: (current: string, next: string) =>
     request<{ ok: true }>('password_change', { body: { current, next } }),
@@ -167,8 +200,20 @@ export const messageApi = {
       'messages_list',
       { body: { conversationId, ...opts } },
     ),
-  send: (p: { conversationId: number; type: string; body?: string; mediaId?: number | null; replyTo?: number | null }) =>
-    request<{ message: Message; conversation: Conversation }>('message_send', { body: p, timeout: 30000 }),
+  send: (p: {
+    conversationId: number;
+    type: string;
+    body?: string;
+    mediaId?: number | null;
+    replyTo?: number | null;
+    poll?: {
+      question: string;
+      kind?: 'choice' | 'dates';
+      multiple?: boolean;
+      options: (string | { text: string; at?: number })[];
+    };
+    location?: { lat: number; lng: number; accuracy?: number; liveSeconds?: number };
+  }) => request<{ message: Message; conversation: Conversation }>('message_send', { body: p, timeout: 30000 }),
   edit: (messageId: number, body: string) => request<{ message: Message }>('message_edit', { body: { messageId, body } }),
   remove: (messageId: number, forEveryone = true) =>
     request<{ ok: true; messageId: number }>('message_delete', { body: { messageId, forEveryone } }),
@@ -180,6 +225,15 @@ export const messageApi = {
   starred: () => request<{ messages: (Message & { conversationTitle: string })[] }>('messages_starred'),
   info: (messageId: number) =>
     request<{ delivered: { id: number; name: string; at: number }[]; read: { id: number; name: string; at: number }[] }>('message_info', { body: { messageId } }),
+  pin: (messageId: number, pinned: boolean) =>
+    request<{ pinnedMessageId: number }>('message_pin', { body: { messageId, pinned } }),
+  votePoll: (messageId: number, optionIndex: number) =>
+    request<{ messageId: number; poll: Poll }>('poll_vote', { body: { messageId, optionIndex } }),
+  updateLocation: (messageId: number, lat: number, lng: number, accuracy: number) =>
+    request<{ location: LocationData; message: Message }>('location_update', { body: { messageId, lat, lng, accuracy } }),
+  stopLocation: (messageId: number) =>
+    request<{ location: LocationData; message: Message }>('location_stop', { body: { messageId } }),
+  mentions: () => request<{ messages: (Message & { conversationTitle: string })[] }>('mentions_list'),
   search: (q: string, conversationId?: number) =>
     request<{ messages: (Message & { conversationTitle: string })[] }>('search_messages', { body: { q, conversationId } }),
   searchAll: (q: string) => request<SearchResults>('search', { body: { q } }),

@@ -10,8 +10,10 @@ import {
 import { accountApi, chatApi, messageApi } from '../services/api';
 import { useApp } from '../context/AppContext';
 import { useDebouncedValue } from '../services/hooks';
+import { SyncStream } from '../services/realtime';
+import { settings } from '../services/settings';
 import { copyText, formatDayLabel, formatListTime, formatTime, groupMessagesByDay, lastSeenLabel, previewText } from '../services/utils';
-import type { Conversation, Media, Message } from '../types';
+import type { Conversation, Media, Message, SyncResponse } from '../types';
 import { MessageBubble } from '../components/MessageBubble';
 import { Composer } from '../components/Composer';
 import { EmojiPicker, QUICK_REACTIONS } from '../components/EmojiPicker';
@@ -74,6 +76,7 @@ export default function ChatPage() {
   const lastReadSentRef = useRef(0);
   const lastUpdatesRef = useRef(Math.floor(Date.now() / 1000) - 2);
   const convSinceRef = useRef(Math.floor(Date.now() / 1000) - 1);
+  const streamLiveRef = useRef(false);
   const nearBottomRef = useRef(true);
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const bottomRef = useRef<HTMLDivElement | null>(null);
@@ -81,6 +84,13 @@ export default function ChatPage() {
 
   conversationRef.current = conversation;
   messagesRef.current = messages;
+
+  const liveLocationKey = useMemo(() => messages
+    .filter((m) => m.mine && m.type === 'location' && m.location
+      && m.location.liveUntil > Date.now() / 1000 && m.location.stoppedAt === 0)
+    .map((m) => m.id)
+    .sort((a, b) => a - b)
+    .join(','), [messages]);
 
   const scrollToBottom = useCallback((smooth = true) => {
     window.setTimeout(() => {
@@ -210,6 +220,34 @@ export default function ChatPage() {
     let inFlight = false;
     let timer: number | undefined;
 
+    const apply = (res: SyncResponse) => {
+      convSinceRef.current = Math.max(res.now - 1, convSinceRef.current);
+      lastUpdatesRef.current = Math.max(res.now - 1, lastUpdatesRef.current);
+      if (res.conversations?.length) applyConversations(res.conversations);
+      setUnreadTotal(res.me.unreadTotal);
+      if (res.messages?.length) mergeIncoming(res.messages);
+      if (res.updates?.length) mergeUpdates(res.updates);
+      if (res.typing) setTyping(res.typing.filter((t) => t.conversationId === convId && t.until > Date.now() / 1000));
+      if (res.presence?.length) {
+        setPresence((prev) => {
+          const next = { ...prev };
+          for (const p of res.presence!) next[p.userId] = { lastSeen: p.lastSeen, online: p.online };
+          return next;
+        });
+      }
+      if (res.readStates?.length) {
+        setMessages((prev) => prev.map((m) => {
+          if (!m.mine) return m;
+          const readers = res.readStates!.filter((r) => r.userId !== me.id && r.lastReadMessageId >= m.id).length;
+          if (readers === m.readCount) return m;
+          return { ...m, readCount: readers, deliveredCount: Math.max(m.deliveredCount, readers) };
+        }));
+      }
+      if (document.visibilityState === 'visible' && lastMessageIdRef.current > lastReadSentRef.current) {
+        void markRead(lastMessageIdRef.current);
+      }
+    };
+
     const tick = async () => {
       if (cancelled || inFlight) return;
       inFlight = true;
@@ -223,31 +261,7 @@ export default function ChatPage() {
           presence: presenceIds,
         });
         if (cancelled) return;
-        convSinceRef.current = Math.max(res.now - 1, convSinceRef.current);
-        lastUpdatesRef.current = Math.max(res.now - 1, lastUpdatesRef.current);
-        if (res.conversations?.length) applyConversations(res.conversations);
-        setUnreadTotal(res.me.unreadTotal);
-        if (res.messages?.length) mergeIncoming(res.messages);
-        if (res.updates?.length) mergeUpdates(res.updates);
-        if (res.typing) setTyping(res.typing.filter((t) => t.conversationId === convId && t.until > Date.now() / 1000));
-        if (res.presence?.length) {
-          setPresence((prev) => {
-            const next = { ...prev };
-            for (const p of res.presence!) next[p.userId] = { lastSeen: p.lastSeen, online: p.online };
-            return next;
-          });
-        }
-        if (res.readStates?.length) {
-          setMessages((prev) => prev.map((m) => {
-            if (!m.mine) return m;
-            const readers = res.readStates!.filter((r) => r.userId !== me.id && r.lastReadMessageId >= m.id).length;
-            if (readers === m.readCount) return m;
-            return { ...m, readCount: readers, deliveredCount: Math.max(m.deliveredCount, readers) };
-          }));
-        }
-        if (document.visibilityState === 'visible' && lastMessageIdRef.current > lastReadSentRef.current) {
-          void markRead(lastMessageIdRef.current);
-        }
+        apply(res);
       } catch (e) {
         const status = (e as { status?: number }).status;
         if (status === 401) {
@@ -257,7 +271,9 @@ export default function ChatPage() {
       } finally {
         inFlight = false;
         if (!cancelled) {
-          timer = window.setTimeout(tick, document.visibilityState === 'hidden' ? 15000 : 2500);
+          // Le flux SSE porte le temps réel ; le polling reste un filet de sécurité.
+          const delay = document.visibilityState === 'hidden' ? 15000 : streamLiveRef.current ? 15000 : 2500;
+          timer = window.setTimeout(tick, delay);
         }
       }
     };
@@ -268,14 +284,72 @@ export default function ChatPage() {
         void tick();
       }
     };
+
+    const stream = new SyncStream({
+      token: settings.token,
+      params: () => ({
+        since: convSinceRef.current,
+        conversationId: convId,
+        afterMessageId: lastMessageIdRef.current,
+        updatesSince: lastUpdatesRef.current,
+      }),
+      onSync: (res) => {
+        if (!cancelled) apply(res);
+      },
+      onState: (state) => {
+        streamLiveRef.current = state === 'live';
+        if (state === 'down' && !cancelled && document.visibilityState === 'visible') {
+          if (timer) window.clearTimeout(timer);
+          timer = undefined;
+          void tick();
+        }
+      },
+    });
+
     document.addEventListener('visibilitychange', onVis);
+    stream.start();
     void tick();
     return () => {
       cancelled = true;
+      stream.stop();
+      streamLiveRef.current = false;
       if (timer) window.clearTimeout(timer);
       document.removeEventListener('visibilitychange', onVis);
     };
   }, [convId, me?.id, applyConversations, setUnreadTotal, mergeIncoming, mergeUpdates, markRead, history]);
+
+  /* ------------------------------- position en direct : mises à jour */
+  useEffect(() => {
+    if (!liveLocationKey || !('geolocation' in navigator)) return undefined;
+    const ids = liveLocationKey.split(',').map(Number).filter((id) => id > 0);
+    if (!ids.length) return undefined;
+    let lastSent = 0;
+    const watchId = navigator.geolocation.watchPosition(
+      (pos) => {
+        const t = Date.now();
+        if (t - lastSent < 20000) return;
+        lastSent = t;
+        void (async () => {
+          for (const id of ids) {
+            try {
+              const res = await messageApi.updateLocation(
+                id,
+                pos.coords.latitude,
+                pos.coords.longitude,
+                pos.coords.accuracy || 0,
+              );
+              setMessages((prev) => prev.map((m) => (m.id === id ? { ...m, location: res.location } : m)));
+            } catch {
+              /* position expirée ou arrêtée */
+            }
+          }
+        })();
+      },
+      () => undefined,
+      { enableHighAccuracy: true, maximumAge: 15000, timeout: 20000 },
+    );
+    return () => navigator.geolocation.clearWatch(watchId);
+  }, [liveLocationKey]);
 
   /* ---------------------------------------------------- recherche interne */
   useEffect(() => {
@@ -336,7 +410,18 @@ export default function ChatPage() {
   }, [loading, location.search, convId, jumpTo, history]);
 
   /* ---------------------------------------------------------- envoi message */
-  const handleSend = useCallback(async (payload: { type: string; body?: string; mediaId?: number }) => {
+  const handleSend = useCallback(async (payload: {
+    type: string;
+    body?: string;
+    mediaId?: number;
+    poll?: {
+      question: string;
+      kind?: 'choice' | 'dates';
+      multiple?: boolean;
+      options: (string | { text: string; at?: number })[];
+    };
+    location?: { lat: number; lng: number; accuracy?: number; liveSeconds?: number };
+  }) => {
     if (!conversation) return false;
     try {
       if (editing) {
@@ -356,6 +441,8 @@ export default function ChatPage() {
         body: payload.body,
         mediaId: payload.mediaId ?? null,
         replyTo: replyTo?.id ?? null,
+        poll: payload.poll,
+        location: payload.location,
       });
       setMessages((prev) => {
         if (prev.some((m) => m.id === res.message.id)) return prev;
@@ -394,6 +481,37 @@ export default function ChatPage() {
       await messageApi.star(message.id, !message.starred);
       setMessages((prev) => prev.map((m) => (m.id === message.id ? { ...m, starred: !m.starred } : m)));
       toast({ title: message.starred ? 'Retiré des favoris' : 'Ajouté aux favoris', tone: 'success' });
+    } catch (e) {
+      toast({ title: 'Action impossible', body: (e as Error).message, tone: 'error' });
+    }
+  };
+
+  const setPinned = async (messageId: number, pinned: boolean) => {
+    try {
+      await messageApi.pin(messageId, pinned);
+      const refreshed = await chatApi.get(convId);
+      setConversation(refreshed.conversation);
+      upsertConversation(refreshed.conversation);
+      toast({ title: pinned ? 'Message épinglé' : 'Message désépinglé', tone: 'success' });
+    } catch (e) {
+      toast({ title: 'Action impossible', body: (e as Error).message, tone: 'error' });
+    }
+  };
+
+  const votePoll = async (message: Message, optionIndex: number) => {
+    try {
+      const res = await messageApi.votePoll(message.id, optionIndex);
+      setMessages((prev) => prev.map((m) => (m.id === message.id ? { ...m, poll: res.poll } : m)));
+    } catch (e) {
+      toast({ title: 'Vote impossible', body: (e as Error).message, tone: 'error' });
+    }
+  };
+
+  const stopLocation = async (message: Message) => {
+    try {
+      const res = await messageApi.stopLocation(message.id);
+      setMessages((prev) => prev.map((m) => (m.id === message.id ? { ...m, location: res.location } : m)));
+      toast({ title: 'Position en direct arrêtée', tone: 'success' });
     } catch (e) {
       toast({ title: 'Action impossible', body: (e as Error).message, tone: 'error' });
     }
@@ -601,6 +719,10 @@ export default function ChatPage() {
   const grouped = groupMessagesByDay(messages);
   const canModerate = conversation.type === 'group' && ['owner', 'admin'].includes(conversation.myRole || '');
   const now = Date.now() / 1000;
+  const pinned = conversation.pinnedMessageId
+    ? (messages.find((m) => m.id === conversation.pinnedMessageId) || conversation.pinnedMessage)
+    : null;
+  const canPinMessage = conversation.type === 'direct' || canModerate;
 
   const menuActions = [
     {
@@ -655,6 +777,31 @@ export default function ChatPage() {
           <IconButton icon={ellipsisVertical} label="Menu" onClick={() => setMenuOpen(true)} />
         </div>
       </header>
+
+      {pinned && (
+        <div className="pinned-banner">
+          <button type="button" className="pinned-banner-main" onClick={() => void jumpTo(pinned.id)}>
+            <span className="pinned-banner-icon"><IonIcon icon={pinOutline} /></span>
+            <span className="pinned-banner-text">
+              <strong>Message épinglé</strong>
+              <em>
+                {pinned.senderName} · {previewText(
+                  pinned.type,
+                  pinned.body,
+                  'deleted' in pinned ? pinned.deleted : pinned.deletedAt > 0,
+                )}
+              </em>
+            </span>
+          </button>
+          {canPinMessage && (
+            <IconButton
+              icon={closeOutline}
+              label="Désépingler le message"
+              onClick={() => void setPinned(pinned.id, false)}
+            />
+          )}
+        </div>
+      )}
 
       {searchOpen && (
         <div className="chat-search">
@@ -726,6 +873,7 @@ export default function ChatPage() {
                       message={m}
                       conversation={conversation}
                       meId={me.id}
+                      meUsername={me.username}
                       showName={showName}
                       showAvatar={showName}
                       contiguous={!showName}
@@ -739,6 +887,8 @@ export default function ChatPage() {
                       onReaction={(msg, emoji) => void react(msg, emoji)}
                       onJumpTo={(mid) => void jumpTo(mid)}
                       onOpenImage={(media) => setImageViewer(media)}
+                      onVotePoll={(msg, index) => void votePoll(msg, index)}
+                      onStopLocation={(msg) => void stopLocation(msg)}
                     />
                   </div>
                 </React.Fragment>
@@ -790,6 +940,20 @@ export default function ChatPage() {
                   <IonIcon icon={arrowRedoOutline} /><span>Répondre</span>
                 </button>
               )}
+              {canPinMessage && !actionMessage.deletedAt && actionMessage.type !== 'system' && (
+                <button
+                  type="button"
+                  className="sheet-action"
+                  onClick={() => {
+                    const isPinned = conversation.pinnedMessageId === actionMessage.id;
+                    setActionMessage(null);
+                    void setPinned(actionMessage.id, !isPinned);
+                  }}
+                >
+                  <IonIcon icon={pinOutline} />
+                  <span>{conversation.pinnedMessageId === actionMessage.id ? 'Désépingler le message' : 'Épingler le message'}</span>
+                </button>
+              )}
               {actionMessage.type === 'text' && actionMessage.body && (
                 <button type="button" className="sheet-action" onClick={() => { void copyMessage(actionMessage); setActionMessage(null); }}>
                   <IonIcon icon={copyOutline} /><span>Copier le texte</span>
@@ -805,7 +969,7 @@ export default function ChatPage() {
                   <IonIcon icon={actionMessage.starred ? starFilled : starOutline} /><span>{actionMessage.starred ? 'Retirer des favoris' : 'Ajouter aux favoris'}</span>
                 </button>
               )}
-              {!actionMessage.deletedAt && (
+              {!actionMessage.deletedAt && ['text', 'image', 'voice', 'file'].includes(actionMessage.type) && (
                 <button type="button" className="sheet-action" onClick={() => { setForwardMessage(actionMessage); setActionMessage(null); }}>
                   <IonIcon icon={arrowRedoOutline} /><span>Transférer</span>
                 </button>

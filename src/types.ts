@@ -3,7 +3,7 @@
 export type UserRole = 'admin' | 'member';
 export type ConversationType = 'direct' | 'group';
 export type ConversationRole = 'owner' | 'admin' | 'member';
-export type MessageType = 'text' | 'image' | 'voice' | 'file' | 'system';
+export type MessageType = 'text' | 'image' | 'voice' | 'file' | 'poll' | 'location' | 'system';
 export type MediaKind = 'image' | 'voice' | 'file';
 export type PrivacyValue = 'everyone' | 'contacts' | 'nobody';
 export type ThemeMode = 'dark' | 'light' | 'system';
@@ -22,10 +22,20 @@ export interface User {
   lastSeen: number;
   online: boolean;
   isContact?: boolean;
+  contactStatus?: ContactStatus;
+  contactRequestId?: number | null;
   hasDirect?: boolean;
   directId?: number | null;
   blocked?: boolean;
   blockedBy?: boolean;
+}
+
+export type ContactStatus = 'self' | 'accepted' | 'pending_in' | 'pending_out' | 'none';
+
+export interface ContactRequest {
+  id: number;
+  createdAt: number;
+  user: User;
 }
 
 export interface NotifPrefs {
@@ -46,6 +56,7 @@ export interface Me extends User {
   notif: NotifPrefs;
   privacy: PrivacyPrefs;
   unreadTotal: number;
+  contactRequests?: number;
   pushDevices?: number;
 }
 
@@ -77,6 +88,36 @@ export interface ReplyPreview {
   mediaId: number | null;
 }
 
+export interface PollOption {
+  text: string;
+  at: number;
+  votes: number;
+  mine: boolean;
+  voters: { id: number; name: string }[];
+}
+
+export interface Poll {
+  id: number;
+  question: string;
+  kind: 'choice' | 'dates';
+  multiple: boolean;
+  options: PollOption[];
+  totalVotes: number;
+  voterCount: number;
+  myVote: number | null;
+  myVotes: number[];
+  createdAt: number;
+}
+
+export interface LocationData {
+  lat: number;
+  lng: number;
+  accuracy: number;
+  liveUntil: number;
+  stoppedAt: number;
+  updatedAt: number;
+}
+
 export interface Message {
   id: number;
   conversationId: number;
@@ -89,6 +130,9 @@ export interface Message {
   media: Media | null;
   replyTo: ReplyPreview | null;
   reactions: Reaction[];
+  mentions: number[];
+  poll: Poll | null;
+  location: LocationData | null;
   readCount: number;
   deliveredCount: number;
   otherCount?: number;
@@ -148,6 +192,8 @@ export interface Conversation {
   onlyAdminsCanPost: number;
   memberCount: number;
   lastMessage: LastMessage | null;
+  pinnedMessageId: number;
+  pinnedMessage: LastMessage | null;
   blocked: boolean;
 }
 
@@ -190,7 +236,7 @@ export interface InviteInfo {
 export interface SyncResponse {
   ok: true;
   now: number;
-  me: { unreadTotal: number; lastSeen: number };
+  me: { unreadTotal: number; contactRequests?: number; lastSeen: number };
   conversations: Conversation[];
   events: Message[];
   messages?: Message[];

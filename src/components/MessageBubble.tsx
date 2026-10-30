@@ -3,16 +3,19 @@ import { IonIcon } from '@ionic/react';
 import {
   checkmarkDoneOutline, checkmarkOutline, ellipsisHorizontal, arrowRedoOutline,
   star, starOutline, imageOutline, micOutline, documentOutline, play,
+  barChartOutline, locationOutline,
 } from 'ionicons/icons';
 import type { Conversation, Media, Message } from '../types';
 import { avatarColors, formatTime, linkify } from '../services/utils';
 import { Avatar } from './ui';
 import { FileCard, MediaImage, VoicePlayer } from './media';
+import { LocationCard, PollCard } from './MessageExtras';
 
 interface MessageBubbleProps {
   message: Message;
   conversation: Conversation;
   meId: number;
+  meUsername?: string;
   showName: boolean;
   showAvatar: boolean;
   contiguous: boolean;
@@ -22,28 +25,33 @@ interface MessageBubbleProps {
   onReaction: (m: Message, emoji: string) => void;
   onJumpTo: (id: number) => void;
   onOpenImage: (m: Media) => void;
+  onVotePoll?: (m: Message, optionIndex: number) => void;
+  onStopLocation?: (m: Message) => void;
 }
 
-function Mentions({ text }: { text: string }) {
+function Mentions({ text, meUsername }: { text: string; meUsername?: string }) {
   const parts = text.split(/(@[a-zA-Z0-9._]{2,24})/g);
+  const me = (meUsername || '').toLowerCase();
   return (
     <>
-      {parts.map((p, i) => (
-        p.startsWith('@') && p.length > 1
-          ? <span key={i} className="mention">{p}</span>
-          : <React.Fragment key={i}>{p}</React.Fragment>
-      ))}
+      {parts.map((p, i) => {
+        const isMention = p.startsWith('@') && p.length > 1;
+        const isMe = isMention && me !== '' && p.slice(1).toLowerCase() === me;
+        return isMention
+          ? <span key={i} className={`mention ${isMe ? 'mention-me' : ''}`}>{p}</span>
+          : <React.Fragment key={i}>{p}</React.Fragment>;
+      })}
     </>
   );
 }
 
-function RichText({ text }: { text: string }) {
+function RichText({ text, meUsername }: { text: string; meUsername?: string }) {
   return (
     <>
       {linkify(text).map((part, i) => (
         part.type === 'link'
           ? <a key={i} href={part.value} target="_blank" rel="noreferrer noopener">{part.value}</a>
-          : <Mentions key={i} text={part.value} />
+          : <Mentions key={i} text={part.value} meUsername={meUsername} />
       ))}
     </>
   );
@@ -59,8 +67,8 @@ function Ticks({ message }: { message: Message }) {
 }
 
 export function MessageBubble({
-  message, conversation, meId, showName, showAvatar, contiguous, highlighted,
-  onAction, onReply, onReaction, onJumpTo, onOpenImage,
+  message, conversation, meId, meUsername, showName, showAvatar, contiguous, highlighted,
+  onAction, onReply, onReaction, onJumpTo, onOpenImage, onVotePoll, onStopLocation,
 }: MessageBubbleProps) {
   if (message.type === 'system') {
     return (
@@ -123,6 +131,8 @@ export function MessageBubble({
                     message.replyTo.type === 'image' ? <><IonIcon icon={imageOutline} /> Photo</> :
                     message.replyTo.type === 'voice' ? <><IonIcon icon={micOutline} /> Message vocal</> :
                     message.replyTo.type === 'file' ? <><IonIcon icon={documentOutline} /> Fichier</> :
+                    message.replyTo.type === 'poll' ? <><IonIcon icon={barChartOutline} /> Sondage</> :
+                    message.replyTo.type === 'location' ? <><IonIcon icon={locationOutline} /> Position</> :
                     message.replyTo.body
                   )}
                 </span>
@@ -143,8 +153,21 @@ export function MessageBubble({
               {message.type === 'file' && message.media && (
                 <FileCard media={message.media} mine={mine} />
               )}
-              {message.body && message.type !== 'file' && (
-                <p className="bubble-text"><RichText text={message.body} /></p>
+              {message.type === 'poll' && message.poll && (
+                <PollCard
+                  poll={message.poll}
+                  onVote={(index) => onVotePoll?.(message, index)}
+                />
+              )}
+              {message.type === 'location' && message.location && (
+                <LocationCard
+                  location={message.location}
+                  mine={mine}
+                  onStop={() => onStopLocation?.(message)}
+                />
+              )}
+              {message.body && !['file', 'poll', 'location'].includes(message.type) && (
+                <p className="bubble-text"><RichText text={message.body} meUsername={meUsername} /></p>
               )}
             </>
           )}

@@ -18,7 +18,7 @@ import JoinPage from './pages/JoinPage';
 import { formatListTime, previewText } from './services/utils';
 
 const Rail: React.FC = () => {
-  const { me, unreadTotal } = useApp();
+  const { me, unreadTotal, contactRequests } = useApp();
   const location = useLocation();
   const history = useHistory();
   if (!me) return null;
@@ -37,6 +37,7 @@ const Rail: React.FC = () => {
         <button type="button" className={`rail-btn ${location.pathname.startsWith('/contacts') || location.pathname.startsWith('/new-group') ? 'active' : ''}`} onClick={() => history.push('/contacts')} title="Contacts">
           <IonIcon icon={peopleOutline} />
           <span>Contacts</span>
+          {contactRequests > 0 && <i className="rail-badge">{contactRequests > 99 ? '99+' : contactRequests}</i>}
         </button>
         <button type="button" className={`rail-btn ${location.pathname.startsWith('/settings') ? 'active' : ''}`} onClick={() => history.push('/settings')} title="Réglages">
           <IonIcon icon={settingsOutline} />
@@ -53,7 +54,7 @@ const Rail: React.FC = () => {
 };
 
 const MobileTabs: React.FC = () => {
-  const { unreadTotal } = useApp();
+  const { unreadTotal, contactRequests } = useApp();
   const location = useLocation();
   const history = useHistory();
   const active = location.pathname === '/' || location.pathname.startsWith('/chat') ? 'chats'
@@ -66,7 +67,10 @@ const MobileTabs: React.FC = () => {
         Discussions
       </button>
       <button type="button" className={active === 'contacts' ? 'active' : ''} onClick={() => history.push('/contacts')}>
-        <span className="tab-icon"><IonIcon icon={peopleOutline} /></span>
+        <span className="tab-icon">
+          <IonIcon icon={peopleOutline} />
+          {contactRequests > 0 && <i>{contactRequests > 99 ? '99+' : contactRequests}</i>}
+        </span>
         Contacts
       </button>
       <button type="button" className={active === 'settings' ? 'active' : ''} onClick={() => history.push('/settings')}>

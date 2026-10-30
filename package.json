@@ -1,6 +1,6 @@
 {
   "name": "messagerie-ionic",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Messagerie moderne type WhatsApp — Ionic React PWA + API PHP SQLite",
   "type": "module",
@@ -8,7 +8,7 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
-    "api": "php -S 127.0.0.1:8110 -t api api/router.php",
+    "api": "PHP_CLI_SERVER_WORKERS=4 php -S 127.0.0.1:8110 -t api api/router.php",
     "icons": "sh scripts/make-icons.sh",
     "deploy:web": "npm run build && ssh root@photos2.dynaspirit.com 'mkdir -p /srv/web/photos/pulse' && scp -r dist/* root@photos2.dynaspirit.com:/srv/web/photos/pulse/",
     "deploy:api": "scp api/api-messagerie.php root@photos2.dynaspirit.com:/srv/web/photos/api-messagerie.php && scp scripts/reset-password.php root@photos2.dynaspirit.com:/srv/web/photos/pulse-reset.php",

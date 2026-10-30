@@ -5,6 +5,7 @@ import {
   addOutline, archiveOutline, chatbubbleEllipsesOutline, checkmarkDoneOutline, checkmarkOutline,
   ellipsisVertical, notificationsOffOutline, peopleOutline, pinOutline, searchOutline, trashOutline,
   personAddOutline, closeOutline, arrowForwardOutline, logOutOutline, timeOutline, chatbubblesOutline,
+  atOutline,
 } from 'ionicons/icons';
 import { chatApi, messageApi } from '../services/api';
 import { useApp } from '../context/AppContext';
@@ -19,7 +20,7 @@ import {
 import { UserProfileModal } from '../components/UserProfileModal';
 import { draftKey } from '../services/settings';
 
-type Filter = 'all' | 'unread' | 'groups' | 'archived';
+type Filter = 'all' | 'unread' | 'groups' | 'mentions' | 'archived';
 
 function lastTicks(c: Conversation, meId: number): 'read' | 'sent' | null {
   if (!c.lastMessage || c.lastMessage.senderId !== meId) return null;
@@ -52,6 +53,8 @@ export default function ChatsPage() {
   const [deleteConv, setDeleteConv] = useState<Conversation | null>(null);
   const [profileUserId, setProfileUserId] = useState<number | null>(null);
   const [drafts, setDrafts] = useState<Record<number, string>>({});
+  const [mentions, setMentions] = useState<(Message & { conversationTitle: string })[]>([]);
+  const [mentionsLoading, setMentionsLoading] = useState(false);
 
   useEffect(() => {
     const map: Record<number, string> = {};
@@ -82,12 +85,24 @@ export default function ChatsPage() {
     return () => { alive = false; window.clearTimeout(timer); };
   }, [debounced]);
 
+  useEffect(() => {
+    if (filter !== 'mentions') return undefined;
+    let alive = true;
+    setMentionsLoading(true);
+    messageApi.mentions()
+      .then((res) => { if (alive) setMentions(res.messages); })
+      .catch(() => { if (alive) setMentions([]); })
+      .finally(() => { if (alive) setMentionsLoading(false); });
+    return () => { alive = false; };
+  }, [filter]);
+
   const archivedCount = conversations.filter((c) => c.archived).length;
   const allCount = conversations.filter((c) => !c.archived).length;
   const unreadCount = conversations.filter((c) => !c.archived && c.unread > 0).length;
   const groupCount = conversations.filter((c) => !c.archived && c.type === 'group').length;
 
   const list = useMemo(() => {
+    if (filter === 'mentions') return [];
     const base = conversations.filter((c) => (filter === 'archived' ? c.archived : !c.archived));
     if (filter === 'unread') return base.filter((c) => c.unread > 0);
     if (filter === 'groups') return base.filter((c) => c.type === 'group');
@@ -211,6 +226,9 @@ export default function ChatsPage() {
           <button type="button" className={`chip ${filter === 'groups' ? 'active' : ''}`} onClick={() => setFilter('groups')}>
             Groupes <span>{groupCount}</span>
           </button>
+          <button type="button" className={`chip ${filter === 'mentions' ? 'active' : ''}`} onClick={() => setFilter('mentions')}>
+            <IonIcon icon={atOutline} /> Mentions
+          </button>
           {archivedCount > 0 && (
             <button type="button" className={`chip ${filter === 'archived' ? 'active' : ''}`} onClick={() => setFilter('archived')}>
               Archivées <span>{archivedCount}</span>
@@ -270,7 +288,34 @@ export default function ChatsPage() {
           </div>
         )}
 
-        {!showSearch && list.length === 0 && (
+        {!showSearch && filter === 'mentions' && (
+          <div className="mentions-panel">
+            {mentionsLoading && <div className="center-pad"><Spinner /></div>}
+            {!mentionsLoading && mentions.length === 0 && (
+              <EmptyState
+                icon={<IonIcon icon={atOutline} />}
+                title="Aucune mention"
+                text="Les messages où quelqu’un vous mentionne avec @votre-identifiant apparaîtront ici."
+              />
+            )}
+            {!mentionsLoading && mentions.map((m) => (
+              <button
+                key={m.id}
+                type="button"
+                className="search-result compact message-result"
+                onClick={() => history.push(`/chat/${m.conversationId}?m=${m.id}`)}
+              >
+                <span className="search-msg-icon"><IonIcon icon={atOutline} /></span>
+                <span>
+                  <strong>{m.conversationTitle}<em>{formatListTime(m.createdAt)}</em></strong>
+                  <span>{m.senderName} : {previewText(m.type, m.body)}</span>
+                </span>
+              </button>
+            ))}
+          </div>
+        )}
+
+        {!showSearch && filter !== 'mentions' && list.length === 0 && (
           <EmptyState
             icon={<IonIcon icon={filter === 'archived' ? archiveOutline : chatbubbleEllipsesOutline} />}
             title={filter === 'archived' ? 'Aucune archive' : filter === 'unread' ? 'Tout est lu' : filter === 'groups' ? 'Aucun groupe' : 'Aucune discussion'}

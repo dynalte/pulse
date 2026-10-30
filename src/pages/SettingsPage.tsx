@@ -35,6 +35,7 @@ export default function SettingsPage() {
   const [bio, setBio] = useState(me?.bio || '');
   const [phone, setPhone] = useState(me?.phone || '');
   const [saving, setSaving] = useState(false);
+  const [updatingApp, setUpdatingApp] = useState(false);
   const [avatarBusy, setAvatarBusy] = useState(false);
   const avatarInput = useRef<HTMLInputElement | null>(null);
   const [pushPermission, setPushPermission] = useState<string>(typeof Notification !== 'undefined' ? Notification.permission : 'unsupported');
@@ -255,6 +256,23 @@ export default function SettingsPage() {
     setApiURL(clean);
     setServerEditing(false);
     toast({ title: 'Adresse enregistrée', body: 'Rechargez l’application si le serveur change.', tone: 'success' });
+  };
+
+  const forceUpdate = async () => {
+    setUpdatingApp(true);
+    try {
+      if ('serviceWorker' in navigator) {
+        const regs = await navigator.serviceWorker.getRegistrations();
+        await Promise.all(regs.map((reg) => reg.update().catch(() => undefined)));
+      }
+      if ('caches' in window) {
+        const keys = await caches.keys();
+        await Promise.all(keys.map((key) => caches.delete(key)));
+      }
+    } catch {
+      /* on recharge quand même */
+    }
+    window.location.reload();
   };
 
   const doAdminAction = async () => {
@@ -591,6 +609,13 @@ export default function SettingsPage() {
         <div className="settings-line">
           <div><strong>Version</strong><span>Pulse PWA</span></div>
           <Tag>{__APP_VERSION__}</Tag>
+        </div>
+        <div className="settings-line">
+          <div><strong>Mise à jour</strong><span>Recharge le dernier build et vide le cache de l’application.</span></div>
+          <button type="button" className="btn ghost small" onClick={() => void forceUpdate()} disabled={updatingApp}>
+            {updatingApp ? <Spinner size={16} /> : <IonIcon icon={refreshOutline} />}
+            Recharger
+          </button>
         </div>
         <div className="settings-line">
           <div><strong>Adresse de l’API</strong><span className="mono">{settings.apiURL}</span></div>

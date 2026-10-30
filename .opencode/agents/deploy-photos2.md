@@ -12,8 +12,10 @@ Tu déploies l'application **Pulse** (projet `messagerie`) sur le serveur photos
 
 Cibles serveur (volume Docker PHP `/srv/web/photos` → `/var/www/html`) :
 - **Front PWA** (dist/) → `/srv/web/photos/pulse/`
-  → https://photos2.dynaspirit.com/pulse/
+  → https://pulse.dynaspirit.com/ (racine du domaine)
+  → https://photos2.dynaspirit.com/pulse/ (URL historique, toujours servie)
 - **API PHP** → `/srv/web/photos/api-messagerie.php`
+  → https://pulse.dynaspirit.com/api-messagerie.php
   → https://photos2.dynaspirit.com/api-messagerie.php
 - **Données** (créées par l'API, ne jamais écraser) :
   - `/srv/web/photos/data/messagerie.sqlite`
@@ -22,6 +24,11 @@ Cibles serveur (volume Docker PHP `/srv/web/photos` → `/var/www/html`) :
 - Conteneur PHP : `php-php-1` (Apache + mod_php 8.3, docroot `/var/www/html`).
   Le PHP CLI n'existe pas sur l'hôte : toujours linter avec
   `docker exec php-php-1 php -l /var/www/html/api-messagerie.php`.
+- Vhost `pulse.dynaspirit.com` : `/srv/php/pulse-vhost.conf`, monté en lecture
+  seule sur `/etc/apache2/sites-enabled/pulse.conf`. `DocumentRoot`
+  `/var/www/html/pulse` + alias `/api-messagerie.php` vers la racine. Ne pas
+  déplacer ce fichier vers `conf-enabled/` : il deviendrait le vhost par défaut
+  et capterait aussi `photos2.dynaspirit.com`.
 
 Étapes obligatoires, dans l'ordre :
 
@@ -35,16 +42,22 @@ Cibles serveur (volume Docker PHP `/srv/web/photos` → `/var/www/html`) :
    ssh root@photos2.dynaspirit.com "
      ls -l --time-style=long-iso /srv/web/photos/api-messagerie.php /srv/web/photos/pulse/index.html
      docker exec php-php-1 php -l /var/www/html/api-messagerie.php
-     curl -sk -o /dev/null -w 'API ping: %{http_code}\n' 'https://photos2.dynaspirit.com/api-messagerie.php?action=ping'
-     curl -sk -o /dev/null -w 'Web pulse: %{http_code}\n' 'https://photos2.dynaspirit.com/pulse/'
-     curl -sk -o /dev/null -w 'Manifest: %{http_code}\n' 'https://photos2.dynaspirit.com/pulse/manifest.webmanifest'
-     curl -sk -o /dev/null -w 'Service worker: %{http_code}\n' 'https://photos2.dynaspirit.com/pulse/sw.js'
-     curl -sk -o /dev/null -w 'DB protégée: %{http_code}\n' 'https://photos2.dynaspirit.com/data/messagerie.sqlite'
-     curl -sk -o /dev/null -w 'Reset script web (doit être 404): %{http_code}\n' 'https://photos2.dynaspirit.com/pulse-reset.php'
+     curl -sk -o /dev/null -w 'Pulse racine: %{http_code}\n' 'https://pulse.dynaspirit.com/'
+     curl -sk -o /dev/null -w 'Pulse API ping: %{http_code}\n' 'https://pulse.dynaspirit.com/api-messagerie.php?action=ping'
+     curl -sk -o /dev/null -w 'Pulse manifest: %{http_code}\n' 'https://pulse.dynaspirit.com/manifest.webmanifest'
+     curl -sk -o /dev/null -w 'Pulse service worker: %{http_code}\n' 'https://pulse.dynaspirit.com/sw.js'
+     curl -sk -o /dev/null -w 'Pulse DB protégée: %{http_code}\n' 'https://pulse.dynaspirit.com/data/messagerie.sqlite'
+     curl -sk -o /dev/null -w 'Pulse reset script (doit être 404): %{http_code}\n' 'https://pulse.dynaspirit.com/pulse-reset.php'
+     curl -sk -o /dev/null -w 'Photos2 API ping: %{http_code}\n' 'https://photos2.dynaspirit.com/api-messagerie.php?action=ping'
+     curl -sk -o /dev/null -w 'Photos2 pulse historique: %{http_code}\n' 'https://photos2.dynaspirit.com/pulse/'
+     curl -sk -o /dev/null -w 'Photos2 racine (doit rester 403): %{http_code}\n' 'https://photos2.dynaspirit.com/'
    "
    ```
-   Attendu : `API ping: 200`, `Web pulse: 200`, `Manifest: 200`, `Service worker: 200`,
-   `DB protégée: 403`, `Reset script web: 404`, et `No syntax errors detected` pour `php -l`.
+   Attendu : `Pulse racine: 200`, `Pulse API ping: 200`, `Pulse manifest: 200`,
+   `Pulse service worker: 200`, `Pulse DB protégée: 403`,
+   `Pulse reset script: 404`, `Photos2 API ping: 200`,
+   `Photos2 pulse historique: 200`, `Photos2 racine: 403`,
+   et `No syntax errors detected` pour `php -l`.
 6. Résume : dates/heures des fichiers déployés, résultat `php -l` et codes HTTP.
 
 Premier déploiement / administration :

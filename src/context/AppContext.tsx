@@ -8,9 +8,10 @@ import { accountApi, authApi, chatApi, messageApi } from '../services/api';
 import { clearMediaCache } from '../services/api';
 import { clearMediaObjectUrls } from '../services/media';
 import { disablePush, enablePush, pushSupported, setAppBadge } from '../services/notifications';
+import { SyncStream } from '../services/realtime';
 import { clearSession, Keys, saveCachedUser, saveSession, setSetting, settings } from '../services/settings';
 import { playNotificationSound, previewText } from '../services/utils';
-import type { Conversation, Me, Message, NotifPrefs, PrivacyPrefs, ThemeMode } from '../types';
+import type { Conversation, Me, Message, NotifPrefs, PrivacyPrefs, SyncResponse, ThemeMode } from '../types';
 
 export interface ToastItem {
   id: number;
@@ -26,6 +27,7 @@ interface AppContextValue {
   booting: boolean;
   conversations: Conversation[];
   unreadTotal: number;
+  contactRequests: number;
   toasts: ToastItem[];
   theme: ThemeMode;
   accent: string;
@@ -67,6 +69,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [booting, setBooting] = useState(true);
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [unreadTotal, setUnreadTotalState] = useState(0);
+  const [contactRequests, setContactRequests] = useState(0);
   const [toasts, setToasts] = useState<ToastItem[]>([]);
   const [theme, setThemeState] = useState<ThemeMode>(settings.theme);
   const [accent, setAccentState] = useState(settings.accent);
@@ -77,8 +80,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const activeConversationRef = useRef<number | null>(null);
   const activeVisibleRef = useRef(false);
   const lastSyncRef = useRef(0);
+  const streamLiveRef = useRef(false);
   const toastIdRef = useRef(1);
   const notifiedRef = useRef<Set<number>>(new Set());
+  const contactRequestsRef = useRef(0);
 
   meRef.current = me;
 
@@ -197,6 +202,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       setMe(res.user);
       saveCachedUser(res.user);
       setUnreadTotal(res.user.unreadTotal ?? 0);
+      contactRequestsRef.current = res.user.contactRequests ?? 0;
+      setContactRequests(contactRequestsRef.current);
       return res.user;
     } catch {
       return null;
@@ -211,6 +218,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setMe(user);
     meRef.current = user;
     setUnreadTotal(user.unreadTotal ?? 0);
+    contactRequestsRef.current = user.contactRequests ?? 0;
+    setContactRequests(contactRequestsRef.current);
     lastSyncRef.current = Math.floor(Date.now() / 1000) - 1;
     try {
       await refreshConversations();
@@ -261,6 +270,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     setMe(null);
     setConversations([]);
     setUnreadTotalState(0);
+    contactRequestsRef.current = 0;
+    setContactRequests(0);
     lastSyncRef.current = 0;
     history.replace('/');
   }, [history]);
@@ -270,6 +281,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     meRef.current = user;
     saveCachedUser(user);
     setUnreadTotal(user.unreadTotal ?? 0);
+    contactRequestsRef.current = user.contactRequests ?? contactRequestsRef.current;
+    setContactRequests(contactRequestsRef.current);
   }, [setUnreadTotal]);
 
   const updateNotif = useCallback(async (n: Partial<NotifPrefs>) => {
@@ -301,6 +314,8 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         setMe(user);
         meRef.current = user;
         setUnreadTotal(user.unreadTotal ?? 0);
+        contactRequestsRef.current = user.contactRequests ?? 0;
+        setContactRequests(contactRequestsRef.current);
         lastSyncRef.current = Math.floor(Date.now() / 1000) - 1;
         await refreshConversations();
         if (user.notif.enabled && pushSupported() && Notification.permission === 'granted') {
@@ -359,10 +374,13 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         if (m.conversationId === activeConversationRef.current && activeVisibleRef.current) continue;
         const conv = conversationsRef.current.find((c) => c.id === m.conversationId);
         if (conv && conv.mutedUntil > now) continue;
+        const mentioned = !!m.mentions?.includes(current.id);
         const title = conv?.type === 'group' ? conv.title : m.senderName || conv?.title || 'Pulse';
-        const body = conv?.type === 'group'
-          ? `${m.senderName} · ${previewText(m.type, m.body)}`
-          : previewText(m.type, m.body);
+        const body = mentioned
+          ? `${m.senderName} vous a mentionné · ${previewText(m.type, m.body)}`
+          : conv?.type === 'group'
+            ? `${m.senderName} · ${previewText(m.type, m.body)}`
+            : previewText(m.type, m.body);
         toast({
           title,
           body: body.slice(0, 160),
@@ -376,16 +394,26 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       }
     };
 
+    const apply = (res: SyncResponse) => {
+      lastSyncRef.current = Math.max(res.now - 1, lastSyncRef.current);
+      if (res.conversations?.length) applyConversations(res.conversations);
+      setUnreadTotal(res.me.unreadTotal);
+      const nextRequests = res.me.contactRequests ?? contactRequestsRef.current;
+      if (nextRequests > contactRequestsRef.current) {
+        toast({ title: 'Nouvelle demande de contact', body: 'Ouvrez Contacts pour accepter ou refuser.', tone: 'info' });
+      }
+      contactRequestsRef.current = nextRequests;
+      setContactRequests(nextRequests);
+      notifyEvents(res.events || []);
+    };
+
     const tick = async () => {
       if (cancelled || inFlight) return;
       inFlight = true;
       try {
         const res = await messageApi.sync({ since: lastSyncRef.current });
         if (cancelled) return;
-        lastSyncRef.current = Math.max(res.now - 1, lastSyncRef.current);
-        if (res.conversations?.length) applyConversations(res.conversations);
-        setUnreadTotal(res.me.unreadTotal);
-        notifyEvents(res.events || []);
+        apply(res);
       } catch (e) {
         const status = (e as { status?: number }).status;
         if (status === 401) {
@@ -396,7 +424,10 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       } finally {
         inFlight = false;
         if (!cancelled) {
-          const delay = document.visibilityState === 'hidden' ? 20000 : (activeConversationRef.current ? 10000 : 6000);
+          // Le flux SSE porte le temps réel ; le polling reste un filet de sécurité.
+          const delay = document.visibilityState === 'hidden'
+            ? 20000
+            : streamLiveRef.current ? 15000 : (activeConversationRef.current ? 10000 : 6000);
           timer = window.setTimeout(tick, delay);
         }
       }
@@ -409,11 +440,32 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
         void tick();
       }
     };
+
+    const stream = new SyncStream({
+      token: settings.token,
+      params: () => ({ since: lastSyncRef.current }),
+      onSync: (res) => {
+        if (!cancelled) apply(res);
+      },
+      onState: (state) => {
+        streamLiveRef.current = state === 'live';
+        // Si le flux tombe, on relance immédiatement le polling pour ne rien perdre.
+        if (state === 'down' && !cancelled && document.visibilityState === 'visible') {
+          if (timer) window.clearTimeout(timer);
+          timer = undefined;
+          void tick();
+        }
+      },
+    });
+
     document.addEventListener('visibilitychange', onVisibility);
+    stream.start();
     void tick();
 
     return () => {
       cancelled = true;
+      stream.stop();
+      streamLiveRef.current = false;
       if (timer) window.clearTimeout(timer);
       document.removeEventListener('visibilitychange', onVisibility);
     };
@@ -424,6 +476,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     booting,
     conversations,
     unreadTotal,
+    contactRequests,
     toasts,
     theme,
     accent,
@@ -449,7 +502,7 @@ export const AppProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     toast,
     dismissToast,
   }), [
-    me, booting, conversations, unreadTotal, toasts, theme, accent, soundEnabled,
+    me, booting, conversations, unreadTotal, contactRequests, toasts, theme, accent, soundEnabled,
     setTheme, setAccent, setSoundEnabled, login, setupAdmin, registerWithInvite, logout,
     refreshMe, refreshConversations, applyConversations, upsertConversation, removeConversation,
     markConversationReadLocal, setUnreadTotal, updateMe, updateNotif, updatePrivacy,

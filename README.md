@@ -6,7 +6,7 @@ recherche, réactions, accusés de lecture, notifications Web Push et panneau d�
 
 - **Frontend** : Ionic 8 + React 19 + Vite, PWA installable (hash routing, mobile-first).
 - **Backend** : un seul fichier PHP (`api/api-messagerie.php`) + SQLite, même esprit que `liste-courses`.
-- **Temps réel** : polling adaptatif (`sync` toutes les 2,5 s dans une conversation), pas de WebSocket.
+- **Temps réel** : flux SSE (`stream`) avec repli automatique sur le polling `sync`.
 - **Design** : thème sombre/clair/système, 4 accents, layout 3 colonnes sur desktop et plein écran sur mobile.
 
 ---
@@ -19,6 +19,9 @@ recherche, réactions, accusés de lecture, notifications Web Push et panneau d�
   (usage unique ou multiple, nominatif, expiration, rôle membre ou admin).
 - Connexion par e-mail **ou** identifiant, mot de passe hashé, sessions révocables.
 - Recherche d’utilisateurs (nom, `@identifiant`, e-mail), annuaire des membres.
+- **Demandes de contact** : envoi, acceptation, refus, annulation et demandes croisées
+  acceptées automatiquement. Les contacts acceptés sont seuls à pouvoir démarrer une
+  conversation privée ; les invitations créent un contact direct avec l’invitant.
 - Fiche utilisateur : avatar, bio, téléphone, dernière connexion, groupes communs, blocage, message direct.
 
 ### Messagerie
@@ -29,6 +32,12 @@ recherche, réactions, accusés de lecture, notifications Web Push et panneau d�
   **transfert** vers une ou plusieurs conversations, **messages favoris**.
 - Accusés **envoyé / distribué / lu** (info détaillée), indicateur de saisie, présence en ligne.
 - **Messages éphémères** 24 h / 7 j / 90 j, mode « seuls les admins écrivent ».
+- **Sondages** via une entrée unique : choix simple ou **sondage de dates façon Doodle**
+  (plusieurs dates proposées, heures optionnelles, cases à cocher multiples, noms des participants
+  et meilleure date mise en avant), résultats en direct, vote modifiable. **Épinglage d’un message**
+  avec bandeau en haut du chat,
+  **@mentions** surlignées avec filtre « Mentions » et push dédié.
+- **Partage de position** ponctuel ou **en direct 15 min / 1 h**, avec arrêt visible par tous.
 - Recherche **globale** (conversations, personnes, messages) et **dans une conversation** avec saut au message.
 - Brouillons locaux, épinglage, archivage, sourdine, marquage lu, suppression de conversation.
 - Blocage d’un contact, confidentialité de la dernière connexion et de la photo de profil.
@@ -43,6 +52,8 @@ recherche, réactions, accusés de lecture, notifications Web Push et panneau d�
 - **Web Push** (VAPID + AES-128-GCM, implémentation PHP native, testée par `scripts/test-push.php`).
 - Préférences : push on/off, messages privés, groupes, aperçu, son, badge.
 - Son local, badge sur l’icône PWA, notification cliquable qui ouvre la bonne conversation.
+- **Réponse rapide depuis la notification** (Android/Chrome) : action « Répondre » vers une page
+  légère (`reply.html`) et action « Marquer lu », sans session ouverte.
 - Installation PWA (Chrome/Edge/Android ; iOS 16.4+ via « Sur l’écran d’accueil »).
 - Thèmes sombre/clair/système et 4 couleurs d’accent, mémorisés sur l’appareil.
 
@@ -82,8 +93,10 @@ npm run dev
 Ouvrir <http://localhost:8102>. La première page propose de **créer le compte administrateur**.
 L’URL par défaut de l’API est `http://localhost:8102/api-messagerie.php`, proxifiée par Vite.
 
-> `php` doit être dans le PATH. En dev, `npm run api` utilise `php -S 127.0.0.1:8110 -t api api/router.php`
-> (le routeur interdit l’accès direct à `api/data/`).
+> `php` doit être dans le PATH. En dev, `npm run api` utilise
+> `PHP_CLI_SERVER_WORKERS=4 php -S 127.0.0.1:8110 -t api api/router.php` (le routeur interdit
+> l’accès direct à `api/data/`). Les workers sont nécessaires pour que le flux SSE ne bloque
+> pas les autres requêtes du serveur intégré.
 
 ---
 
@@ -93,10 +106,18 @@ L’URL par défaut de l’API est `http://localhost:8102/api-messagerie.php`, p
 
 L’instance est publiée sur le serveur `photos2` :
 
-- **Web** : https://photos2.dynaspirit.com/pulse/
-- **API** : https://photos2.dynaspirit.com/api-messagerie.php
+- **Web** : https://pulse.dynaspirit.com/
+- **API** : https://pulse.dynaspirit.com/api-messagerie.php
+- **URL historique** : https://photos2.dynaspirit.com/pulse/ (toujours servie)
 - **Données serveur** : `/srv/web/photos/data/messagerie.sqlite` + `data/messagerie-media/`
 - **Conteneur PHP** : `php-php-1` (Apache + mod_php 8.3), docroot `/var/www/html`
+
+Le sous-domaine `pulse.dynaspirit.com` est servi à la racine par un vhost Apache
+dédié (`/srv/php/pulse-vhost.conf`, monté sur
+`/etc/apache2/sites-enabled/pulse.conf` dans le conteneur). Son `DocumentRoot`
+pointe sur `/var/www/html/pulse`, et `/api-messagerie.php` est aliasé vers
+`/var/www/html/api-messagerie.php` pour partager la même base. Le vhost par
+défaut (`photos2.dynaspirit.com`) n’est pas modifié.
 
 Commandes :
 
@@ -198,21 +219,35 @@ hors le fallback `index.html`.
 
 ---
 
-## 4. Temps réel : pourquoi pas de WebSocket ?
+## 4. Temps réel : SSE, avec polling de secours
 
-Pour ce volume (famille/amis, quelques dizaines d’utilisateurs), le polling est plus simple à héberger
-et suffisamment fluide :
+Le serveur pousse les changements par **Server-Sent Events** (`?action=stream`) ; le polling
+`sync` reste actif comme filet de sécurité si le flux tombe.
 
-- `sync?conversationId=…` toutes les **2,5 s** quand une conversation est ouverte ;
-- `sync` global toutes les **6 s** (liste, badges, notifications) et **10–20 s** en arrière-plan ;
-- heartbeat implicite : chaque appel authentifié met à jour `last_seen` (présence) ;
-- indicateur de saisie stocké en base avec expiration à 7 s ;
-- la synchronisation renvoie aussi les **éditions, suppressions et réactions** (`updated_at` des messages).
+- `stream?conversationId=…` quand une conversation est ouverte (messages, réactions, saisie,
+  présence, accusés de lecture), et `stream` global pour la liste, les badges et les notifications ;
+- le serveur vérifie l’état toutes les **700 ms** et n’émet un événement que si quelque chose
+  a changé (empreinte légère sur `messages`, `conversations`, `typing`, `read_states`, présence) ;
+- la connexion est volontairement **courte (~20 s)** puis renouvelée automatiquement par le client :
+  cela reste compatible avec Apache/mod_php, les proxys et les limites d’exécution PHP ;
+- commentaire `: ping` toutes les 10 s pour maintenir la connexion et détecter les coupures ;
+- le polling de secours passe à **15 s** quand le flux est actif (au lieu de 2,5 s / 6 s quand il
+  est indisponible), et un tick immédiat est déclenché à la reconnexion ;
+- `visibilitychange` ferme le flux quand l’onglet est masqué (Web Push prend le relais) et le
+  rouvre au retour au premier plan ;
+- heartbeat implicite : chaque requête authentifiée met à jour `last_seen` (présence) ;
+- l’indicateur de saisie reste stocké en base avec expiration à 7 s.
 
-Latence perçue : ~2,5 s maximum. Pour passer à du vrai temps réel, la couche `sync` est isolée :
-on peut ajouter SSE (`?action=stream`) ou un petit serveur WebSocket Node/PHP sans toucher au modèle
-de données. Une conversation de groupe avec 250 membres resterait raisonnable en polling, mais
-un WebSocket deviendra pertinent au-delà de quelques centaines d’utilisateurs simultanés.
+**Pourquoi SSE et pas WebSocket ?** Apache + `mod_php` ne peut pas héberger un WebSocket sans
+processus séparé (Node, Ratchet, proxy WS…). SSE utilise l’API existante, le même modèle de
+données et le même déploiement. Chaque flux ouvert immobilise un worker Apache pendant ~20 s :
+pour quelques dizaines d’utilisateurs c’est négligeable, mais au-delà de quelques centaines de
+connexions simultanées, passer à un serveur WebSocket dédié devient pertinent — la couche
+`SyncStream` (`src/services/realtime.ts`) isole déjà le transport.
+
+> Le jeton de session transite par `?session=` pour le flux, car `EventSource` ne permet pas
+> d’envoyer l’en-tête `X-Session-Token`. Les journaux serveur contiennent donc l’URL du flux :
+> pensez à les protéger ou à passer à un cookie de session si cela pose problème.
 
 ---
 
@@ -236,7 +271,7 @@ Toutes les actions passent par `?action=…`. Auth : header `X-Session-Token`
   `conversation_media`
 - Messages : `messages_list`, `message_send`, `message_edit`, `message_delete`, `message_forward`,
   `message_react`, `message_star`, `messages_starred`, `message_info`, `search_messages`, `search`,
-  `typing`, `sync`
+  `typing`, `sync`, `stream` (SSE, jeton via `?session=`)
 - Médias : `media_upload` (multipart), `media_get`
 - Push : `push_subscribe`, `push_unsubscribe`, `push_test`
 - Admin : `admin_users`, `admin_user_update`, `admin_stats`
@@ -337,7 +372,7 @@ src/
   context/AppContext.tsx session, sync globale, toasts, thème, push
   components/            chat, composer, médias, modales, profil, groupe…
   pages/                 Auth, Chats, Chat, Contacts, Settings, NewGroup, Join
-  services/              api, settings, notifications, voice, image, utils
+  services/              api, realtime (SSE), settings, notifications, voice, image, utils
   styles/app.css         design system complet
 ```
 
@@ -345,10 +380,11 @@ src/
 
 ## 10. Roadmap suggérée
 
-1. **Appels audio/vidéo** (WebRTC + signalisation via `sync`/WebSocket).
+1. **Appels audio/vidéo** (WebRTC + signalisation via `stream`/WebSocket).
 2. **Statuts / stories** 24 h avec audience paramétrable.
 3. **Chiffrement de bout en bout** (Signal Protocol ou libsodium + appareils de confiance).
-4. **SSE/WebSocket** pour la latence < 300 ms et les appels.
+4. **WebSocket dédié** si le nombre de connexions simultanées dépasse la capacité des workers Apache
+   (SSE déjà en place pour la latence < 1 s et les appels).
 5. **Sauvegarde/export** (JSON par conversation, export admin, restauration).
 6. **Envoi d’e-mails** transactionnels (invitations, réinitialisation de mot de passe).
 7. **FTS5** pour la recherche plein texte à grande échelle.

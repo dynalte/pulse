@@ -1,8 +1,8 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { IonIcon } from '@ionic/react';
 import {
-  attachOutline, closeCircle, documentOutline, happyOutline, imageOutline, micOutline,
-  send, stopCircleOutline, trashOutline, createOutline,
+  attachOutline, barChartOutline, closeCircle, documentOutline, happyOutline, imageOutline,
+  locationOutline, micOutline, send, stopCircleOutline, trashOutline, createOutline,
 } from 'ionicons/icons';
 import { uploadMedia } from '../services/api';
 import { useApp } from '../context/AppContext';
@@ -14,11 +14,19 @@ import type { Conversation, Message, MessageType } from '../types';
 import { EmojiPicker } from './EmojiPicker';
 import { ActionSheet, IconButton, Spinner } from './ui';
 import { useClickOutside } from '../services/hooks';
+import { LocationShareModal, PollComposerModal } from './ComposerExtras';
 
 interface SendPayload {
   type: MessageType;
   body?: string;
   mediaId?: number;
+  poll?: {
+    question: string;
+    kind?: 'choice' | 'dates';
+    multiple?: boolean;
+    options: (string | { text: string; at?: number })[];
+  };
+  location?: { lat: number; lng: number; accuracy?: number; liveSeconds?: number };
 }
 
 export function Composer({
@@ -40,6 +48,8 @@ export function Composer({
   const [uploading, setUploading] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [recording, setRecording] = useState(false);
+  const [pollOpen, setPollOpen] = useState(false);
+  const [locationOpen, setLocationOpen] = useState(false);
   const [recSeconds, setRecSeconds] = useState(0);
   const [recLevel, setRecLevel] = useState(4);
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
@@ -144,6 +154,41 @@ export function Composer({
       }
     } catch (e) {
       toast({ title: 'Envoi impossible', body: (e as Error).message, tone: 'error' });
+    } finally {
+      setUploading(null);
+    }
+  };
+
+  const sendPoll = async (
+    question: string,
+    options: (string | { text: string; at?: number })[],
+    kind: 'choice' | 'dates',
+  ): Promise<boolean> => {
+    if (disabled) return false;
+    setUploading(kind === 'dates' ? 'Envoi du sondage de dates…' : 'Envoi du sondage…');
+    try {
+      const ok = await onSend({
+        type: 'poll',
+        body: question,
+        poll: { question, kind, multiple: kind === 'dates', options },
+      });
+      if (ok) {
+        setText('');
+        onSent();
+      }
+      return ok;
+    } finally {
+      setUploading(null);
+    }
+  };
+
+  const sendLocation = async (location: { lat: number; lng: number; accuracy: number; liveSeconds: number }): Promise<boolean> => {
+    if (disabled) return false;
+    setUploading('Partage de la position…');
+    try {
+      const ok = await onSend({ type: 'location', location });
+      if (ok) onSent();
+      return ok;
     } finally {
       setUploading(null);
     }
@@ -330,7 +375,20 @@ export function Composer({
         actions={[
           { label: 'Photo', icon: imageOutline, onClick: () => imageInput.current?.click() },
           { label: 'Document', icon: documentOutline, onClick: () => fileInput.current?.click() },
+          { label: 'Sondage', icon: barChartOutline, onClick: () => setPollOpen(true) },
+          { label: 'Position', icon: locationOutline, onClick: () => setLocationOpen(true) },
         ]}
+      />
+
+      <PollComposerModal
+        open={pollOpen}
+        onClose={() => setPollOpen(false)}
+        onSubmit={sendPoll}
+      />
+      <LocationShareModal
+        open={locationOpen}
+        onClose={() => setLocationOpen(false)}
+        onSubmit={sendLocation}
       />
     </div>
   );

@@ -11,9 +11,12 @@
       - Le tout premier compte créé via ?action=bootstrap devient administrateur.
       - Les comptes suivants sont créés uniquement sur invitation (?action=register).
       - Session = jeton aléatoire (header X-Session-Token), valable 1 an.
-      - Temps réel : polling adaptatif de ?action=sync (2 s dans une conversation,
-        6 s sur la liste). Pas de WebSocket : inutile à cette échelle et plus simple
-        à héberger. La structure de sync permet d'ajouter SSE/WS plus tard.
+      - Temps réel : flux SSE ?action=stream (connexion courte, renouvelée par le
+        client) qui pousse les mêmes charges utiles que ?action=sync. Le polling
+        adaptatif de sync reste en secours si le flux tombe.
+      - SSE et non WebSocket : compatible avec Apache + mod_php, sans service
+        supplémentaire. Le jeton passe par ?session= (EventSource n'envoie pas
+        d'en-tête personnalisé).
 
     Sécurité : mots de passe hashés (password_hash), jetons en base, limitation
     des tentatives de connexion, uploads validés (MIME + taille + ré-encodage image),
@@ -30,8 +33,10 @@ const MAX_IMAGE_DIM = 1920;                    // ré-encodage serveur au-delà
 const INVITE_TTL = 7 * 24 * 3600;              // validité par défaut d'une invitation
 const ALLOW_MEMBER_INVITES = true;             // les membres peuvent inviter
 const MAX_GROUP_MEMBERS = 250;
+const STREAM_TTL = 20;                        // durée d'une connexion SSE (s)
+const STREAM_TICK_MS = 700;                   // intervalle de détection des changements
 const APP_NAME = 'Pulse';
-const APP_VERSION = '0.1.0';
+const APP_VERSION = '0.2.0';
 const VAPID_SUBJECT = 'mailto:admin@pulse.local';
 // =====================================================================
 
@@ -268,6 +273,7 @@ function migrate(PDO $pdo): void
         invite_code TEXT UNIQUE,
         disappearing_seconds INTEGER NOT NULL DEFAULT 0,
         only_admins_can_post INTEGER NOT NULL DEFAULT 0,
+        pinned_message_id INTEGER NOT NULL DEFAULT 0,
         deleted INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS conversation_members (
@@ -312,7 +318,8 @@ function migrate(PDO $pdo): void
         deleted_at INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL DEFAULT 0,
-        expires_at INTEGER NOT NULL DEFAULT 0
+        expires_at INTEGER NOT NULL DEFAULT 0,
+        meta TEXT NOT NULL DEFAULT '{}'
     );
     CREATE INDEX IF NOT EXISTS idx_msg_conv ON messages(conversation_id, id);
     CREATE INDEX IF NOT EXISTS idx_msg_created ON messages(created_at);
@@ -334,6 +341,30 @@ function migrate(PDO $pdo): void
         created_at INTEGER NOT NULL,
         PRIMARY KEY (user_id, message_id)
     );
+    CREATE TABLE IF NOT EXISTS message_mentions (
+        message_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        PRIMARY KEY (message_id, user_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_mentions_user ON message_mentions(user_id, message_id);
+    CREATE TABLE IF NOT EXISTS polls (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        message_id INTEGER NOT NULL UNIQUE,
+        conversation_id INTEGER NOT NULL,
+        question TEXT NOT NULL,
+        options TEXT NOT NULL,
+        kind TEXT NOT NULL DEFAULT 'choice',
+        multiple INTEGER NOT NULL DEFAULT 0,
+        created_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS poll_votes (
+        poll_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        option_index INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (poll_id, user_id, option_index)
+    );
+    CREATE INDEX IF NOT EXISTS idx_poll_votes ON poll_votes(poll_id);
     CREATE TABLE IF NOT EXISTS typing (
         conversation_id INTEGER NOT NULL,
         user_id INTEGER NOT NULL,
@@ -346,6 +377,21 @@ function migrate(PDO $pdo): void
         created_at INTEGER NOT NULL,
         PRIMARY KEY (blocker_id, blocked_id)
     );
+    CREATE TABLE IF NOT EXISTS contacts (
+        user_id INTEGER NOT NULL,
+        contact_id INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (user_id, contact_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_contacts_user ON contacts(user_id);
+    CREATE TABLE IF NOT EXISTS contact_requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        from_user_id INTEGER NOT NULL,
+        to_user_id INTEGER NOT NULL,
+        created_at INTEGER NOT NULL,
+        UNIQUE (from_user_id, to_user_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_contact_requests_to ON contact_requests(to_user_id, created_at);
     CREATE TABLE IF NOT EXISTS push_subscriptions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER NOT NULL,
@@ -370,9 +416,76 @@ function migrate(PDO $pdo): void
     if (!array_filter($cols, fn($c) => ($c['name'] ?? '') === 'updated_at')) {
         $pdo->exec('ALTER TABLE messages ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0');
     }
+    if (!array_filter($cols, fn($c) => ($c['name'] ?? '') === 'meta')) {
+        $pdo->exec("ALTER TABLE messages ADD COLUMN meta TEXT NOT NULL DEFAULT '{}'");
+    }
     $pdo->exec('UPDATE messages SET updated_at = created_at WHERE updated_at = 0');
     $pdo->exec('CREATE INDEX IF NOT EXISTS idx_msg_updated ON messages(conversation_id, updated_at)');
+    $convCols = $pdo->query('PRAGMA table_info(conversations)')->fetchAll();
+    if (!array_filter($convCols, fn($c) => ($c['name'] ?? '') === 'pinned_message_id')) {
+        $pdo->exec('ALTER TABLE conversations ADD COLUMN pinned_message_id INTEGER NOT NULL DEFAULT 0');
+    }
+    // Migration des sondages : type (choix / dates), choix multiple et
+    // clé primaire des votes incluant l'option (plusieurs dates possibles).
+    $pollCols = $pdo->query('PRAGMA table_info(polls)')->fetchAll();
+    $voteCols = $pdo->query('PRAGMA table_info(poll_votes)')->fetchAll();
+    $needsPollMigration = !array_filter($pollCols, fn($c) => ($c['name'] ?? '') === 'kind')
+        || !array_filter($pollCols, fn($c) => ($c['name'] ?? '') === 'multiple');
+    $multiPk = false;
+    foreach ($voteCols as $col) {
+        if (($col['name'] ?? '') === 'option_index' && (int)($col['pk'] ?? 0) > 0) $multiPk = true;
+    }
+    if (!$multiPk) $needsPollMigration = true;
+    if ($needsPollMigration) {
+        // BEGIN IMMEDIATE sérialise la migration entre requêtes concurrentes ;
+        // le schéma est revérifié après acquisition du verrou.
+        $pdo->exec('BEGIN IMMEDIATE');
+        try {
+            $pollCols = $pdo->query('PRAGMA table_info(polls)')->fetchAll();
+            if (!array_filter($pollCols, fn($c) => ($c['name'] ?? '') === 'kind')) {
+                $pdo->exec("ALTER TABLE polls ADD COLUMN kind TEXT NOT NULL DEFAULT 'choice'");
+            }
+            if (!array_filter($pollCols, fn($c) => ($c['name'] ?? '') === 'multiple')) {
+                $pdo->exec('ALTER TABLE polls ADD COLUMN multiple INTEGER NOT NULL DEFAULT 0');
+            }
+            $voteCols = $pdo->query('PRAGMA table_info(poll_votes)')->fetchAll();
+            $multiPk = false;
+            foreach ($voteCols as $col) {
+                if (($col['name'] ?? '') === 'option_index' && (int)($col['pk'] ?? 0) > 0) $multiPk = true;
+            }
+            if (!$multiPk) {
+                $pdo->exec('ALTER TABLE poll_votes RENAME TO poll_votes_legacy');
+                $pdo->exec('CREATE TABLE poll_votes (
+                    poll_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    option_index INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY (poll_id, user_id, option_index)
+                )');
+                $pdo->exec('INSERT OR IGNORE INTO poll_votes(poll_id, user_id, option_index, created_at)
+                    SELECT poll_id, user_id, option_index, created_at FROM poll_votes_legacy');
+                $pdo->exec('DROP TABLE poll_votes_legacy');
+                $pdo->exec('CREATE INDEX IF NOT EXISTS idx_poll_votes ON poll_votes(poll_id)');
+            }
+            $pdo->exec('COMMIT');
+        } catch (Throwable $e) {
+            try { $pdo->exec('ROLLBACK'); } catch (Throwable $ignored) {}
+            throw $e;
+        }
+    }
+    // Reprise des relations existantes : les personnes qui partagent déjà une
+    // conversation deviennent contacts acceptés (une seule fois).
+    if (meta_get('contacts_seeded') === null) {
+        $t = now();
+        $pdo->exec("INSERT OR IGNORE INTO contacts(user_id, contact_id, created_at)
+            SELECT DISTINCT m1.user_id, m2.user_id, $t
+            FROM conversation_members m1
+            JOIN conversation_members m2 ON m2.conversation_id = m1.conversation_id AND m2.user_id <> m1.user_id
+            JOIN conversations c ON c.id = m1.conversation_id AND c.deleted = 0");
+        meta_set('contacts_seeded', (string)$t);
+    }
     meta_set_if_absent('installed_at', (string)now());
+    meta_set_if_absent('quick_token_secret', b64u(random_bytes(32)));
 }
 
 function meta_get(string $key): ?string
@@ -392,6 +505,43 @@ function meta_set(string $key, string $value): void
 function meta_set_if_absent(string $key, string $value): void
 {
     if (meta_get($key) === null) meta_set($key, $value);
+}
+
+/**
+ * Jeton court signé (HMAC) pour répondre à une notification sans session.
+ * Il autorise uniquement l'envoi d'un message ou le marquage lu dans UNE
+ * conversation, pour UN utilisateur, jusqu'à expiration.
+ */
+function quick_secret(): string
+{
+    $secret = meta_get('quick_token_secret');
+    if (!$secret) {
+        $secret = b64u(random_bytes(32));
+        meta_set('quick_token_secret', $secret);
+    }
+    return $secret;
+}
+
+function quick_token(int $userId, int $conversationId, int $expiresAt): string
+{
+    $payload = b64u(json_encode(['u' => $userId, 'c' => $conversationId, 'e' => $expiresAt]));
+    $sig = b64u(hash_hmac('sha256', $payload, quick_secret(), true));
+    return $payload . '.' . $sig;
+}
+
+function quick_token_verify(string $token): ?array
+{
+    $parts = explode('.', $token);
+    if (count($parts) !== 2 || $parts[0] === '' || $parts[1] === '') return null;
+    $expected = b64u(hash_hmac('sha256', $parts[0], quick_secret(), true));
+    if (!hash_equals($expected, $parts[1])) return null;
+    $payload = json_decode(b64u_dec($parts[0]), true);
+    if (!is_array($payload)) return null;
+    $uid = (int)($payload['u'] ?? 0);
+    $cid = (int)($payload['c'] ?? 0);
+    $exp = (int)($payload['e'] ?? 0);
+    if ($uid <= 0 || $cid <= 0 || $exp < now()) return null;
+    return [$uid, $cid];
 }
 
 // ============================== THROTTLE ==============================
@@ -515,11 +665,37 @@ function online(int $lastSeen): bool
 function is_contact(int $a, int $b): bool
 {
     if ($a === $b) return true;
-    $st = db()->prepare('SELECT 1 FROM conversation_members m1
-        JOIN conversation_members m2 ON m2.conversation_id = m1.conversation_id
-        WHERE m1.user_id = ? AND m2.user_id = ? LIMIT 1');
+    $st = db()->prepare('SELECT 1 FROM contacts WHERE user_id = ? AND contact_id = ? LIMIT 1');
     $st->execute([$a, $b]);
     return (bool)$st->fetchColumn();
+}
+
+/** Relation de contact entre deux utilisateurs (accepted / pending_in / pending_out / none). */
+function contact_relation(int $viewerId, int $targetId): array
+{
+    if ($viewerId === $targetId) return ['status' => 'self', 'requestId' => null];
+    $st = db()->prepare('SELECT 1 FROM contacts WHERE user_id = ? AND contact_id = ? LIMIT 1');
+    $st->execute([$viewerId, $targetId]);
+    if ($st->fetchColumn()) return ['status' => 'accepted', 'requestId' => null];
+    $st = db()->prepare('SELECT id, from_user_id FROM contact_requests
+        WHERE (from_user_id = ? AND to_user_id = ?) OR (from_user_id = ? AND to_user_id = ?)
+        ORDER BY id DESC LIMIT 1');
+    $st->execute([$viewerId, $targetId, $targetId, $viewerId]);
+    $row = $st->fetch();
+    if ($row) {
+        return [
+            'status' => (int)$row['from_user_id'] === $viewerId ? 'pending_out' : 'pending_in',
+            'requestId' => (int)$row['id'],
+        ];
+    }
+    return ['status' => 'none', 'requestId' => null];
+}
+
+function contact_request_count(int $userId): int
+{
+    $st = db()->prepare('SELECT COUNT(*) FROM contact_requests WHERE to_user_id = ?');
+    $st->execute([$userId]);
+    return (int)$st->fetchColumn();
 }
 
 function user_is_blocked(int $viewerId, int $targetId): bool
@@ -540,7 +716,8 @@ function public_user(array $u, int $viewerId, bool $full = false): array
     $targetId = (int)($u['id'] ?? $u['user_id'] ?? 0);
     $isSelf = $targetId === $viewerId;
     $privacy = user_privacy($u);
-    $contact = $isSelf ? true : is_contact($viewerId, $targetId);
+    $relation = contact_relation($viewerId, $targetId);
+    $contact = $isSelf ? true : $relation['status'] === 'accepted';
 
     $showLastSeen = $isSelf || $privacy['lastSeen'] === 'everyone' || ($privacy['lastSeen'] === 'contacts' && $contact);
     $lastSeen = $showLastSeen ? (int)$u['last_seen'] : 0;
@@ -558,6 +735,8 @@ function public_user(array $u, int $viewerId, bool $full = false): array
         'lastSeen' => $lastSeen,
         'online' => $showLastSeen && online((int)$u['last_seen']),
         'isContact' => $contact,
+        'contactStatus' => $relation['status'],
+        'contactRequestId' => $relation['requestId'],
         'blocked' => user_is_blocked($viewerId, $targetId),
         'blockedBy' => user_blocks_me($viewerId, $targetId),
     ];
@@ -578,6 +757,7 @@ function me_payload(array $u): array
     $me['notif'] = user_notif($u);
     $me['privacy'] = user_privacy($u);
     $me['unreadTotal'] = unread_total((int)$u['id']);
+    $me['contactRequests'] = contact_request_count((int)$u['id']);
     $st = db()->prepare('SELECT COUNT(*) FROM push_subscriptions WHERE user_id = ?');
     $st->execute([(int)$u['id']]);
     $me['pushDevices'] = (int)$st->fetchColumn();
@@ -743,6 +923,108 @@ function media_from_joined(array $m): ?array
 
 // ============================== MESSAGES JSON ==============================
 
+function message_meta(array $row): array
+{
+    $raw = (string)($row['meta'] ?? '');
+    if ($raw === '') return [];
+    $decoded = json_decode($raw, true);
+    return is_array($decoded) ? $decoded : [];
+}
+
+function location_from_row(array $row): ?array
+{
+    if ((string)($row['type'] ?? '') !== 'location') return null;
+    $meta = message_meta($row);
+    if (!isset($meta['lat'], $meta['lng'])) return null;
+    return [
+        'lat' => (float)$meta['lat'],
+        'lng' => (float)$meta['lng'],
+        'accuracy' => (float)($meta['accuracy'] ?? 0),
+        'liveUntil' => (int)($meta['liveUntil'] ?? 0),
+        'stoppedAt' => (int)($meta['stoppedAt'] ?? 0),
+        'updatedAt' => (int)($meta['updatedAt'] ?? ($row['updated_at'] ?? 0)),
+    ];
+}
+
+/** Résout les @identifiants du texte vers les membres de la conversation. */
+function resolve_mentions(string $body, array $members, int $senderId): array
+{
+    if ($body === '' || strpos($body, '@') === false) return [];
+    if (!preg_match_all('/(?<![\w@])@([A-Za-z0-9._]{2,24})/u', $body, $m)) return [];
+    $byUsername = [];
+    foreach ($members as $row) {
+        $uid = (int)$row['user_id'];
+        if ($uid === $senderId) continue;
+        $byUsername[strtolower((string)$row['username'])] = $uid;
+    }
+    $ids = [];
+    foreach (array_unique($m[1]) as $username) {
+        $uid = $byUsername[strtolower($username)] ?? 0;
+        if ($uid > 0) $ids[$uid] = $uid;
+    }
+    return array_values($ids);
+}
+
+function save_message_mentions(int $messageId, array $userIds): void
+{
+    db()->prepare('DELETE FROM message_mentions WHERE message_id = ?')->execute([$messageId]);
+    if (!$userIds) return;
+    $st = db()->prepare('INSERT OR IGNORE INTO message_mentions(message_id, user_id) VALUES(?,?)');
+    foreach ($userIds as $uid) $st->execute([$messageId, (int)$uid]);
+}
+
+function message_mention_ids(int $messageId): array
+{
+    $st = db()->prepare('SELECT user_id FROM message_mentions WHERE message_id = ?');
+    $st->execute([$messageId]);
+    return array_map('intval', $st->fetchAll(PDO::FETCH_COLUMN));
+}
+
+function poll_payload(array $poll, array $votes, int $viewerId): array
+{
+    $options = json_decode((string)$poll['options'], true);
+    if (!is_array($options)) $options = [];
+    $kind = in_array((string)($poll['kind'] ?? 'choice'), ['choice', 'dates'], true)
+        ? (string)($poll['kind'] ?? 'choice') : 'choice';
+    $multiple = $kind === 'dates' || (int)($poll['multiple'] ?? 0) === 1;
+    $counts = array_fill(0, count($options), 0);
+    $voters = array_fill(0, count($options), []);
+    $myVotes = [];
+    $voterIds = [];
+    foreach ($votes as $vote) {
+        $idx = (int)$vote['option_index'];
+        if (!isset($counts[$idx])) continue;
+        $counts[$idx]++;
+        $voterIds[(int)$vote['user_id']] = true;
+        $voters[$idx][] = ['id' => (int)$vote['user_id'], 'name' => (string)($vote['name'] ?? '')];
+        if ((int)$vote['user_id'] === $viewerId) $myVotes[] = $idx;
+    }
+    $out = [];
+    foreach ($options as $i => $option) {
+        $text = is_array($option) ? (string)($option['text'] ?? '') : (string)$option;
+        $at = is_array($option) ? (int)($option['at'] ?? 0) : 0;
+        $out[] = [
+            'text' => $text,
+            'at' => $at,
+            'votes' => $counts[$i] ?? 0,
+            'mine' => in_array($i, $myVotes, true),
+            'voters' => $voters[$i] ?? [],
+        ];
+    }
+    return [
+        'id' => (int)$poll['id'],
+        'question' => (string)$poll['question'],
+        'kind' => $kind,
+        'multiple' => $multiple,
+        'options' => $out,
+        'totalVotes' => array_sum($counts),
+        'voterCount' => count($voterIds),
+        'myVote' => $myVotes[0] ?? null,
+        'myVotes' => $myVotes,
+        'createdAt' => (int)$poll['created_at'],
+    ];
+}
+
 function attach_messages(array $rows, int $viewerId, array $members): array
 {
     if (!$rows) return [];
@@ -762,6 +1044,30 @@ function attach_messages(array $rows, int $viewerId, array $members): array
     $st = db()->prepare("SELECT message_id FROM stars WHERE user_id = ? AND message_id IN ($in)");
     $st->execute(array_merge([$viewerId], $ids));
     foreach ($st->fetchAll() as $r) $stars[(int)$r['message_id']] = true;
+
+    // Mentions (@identifiant résolu côté serveur).
+    $mentions = [];
+    $st = db()->prepare("SELECT message_id, user_id FROM message_mentions WHERE message_id IN ($in)");
+    $st->execute($ids);
+    foreach ($st->fetchAll() as $r) $mentions[(int)$r['message_id']][] = (int)$r['user_id'];
+
+    // Sondages et votes.
+    $polls = [];
+    $pollVotes = [];
+    $st = db()->prepare("SELECT * FROM polls WHERE message_id IN ($in)");
+    $st->execute($ids);
+    $pollRows = $st->fetchAll();
+    if ($pollRows) {
+        $pollIds = array_map(fn($r) => (int)$r['id'], $pollRows);
+        $pin = implode(',', array_fill(0, count($pollIds), '?'));
+        $st = db()->prepare("SELECT pv.poll_id, pv.user_id, pv.option_index, u.name
+            FROM poll_votes pv JOIN users u ON u.id = pv.user_id WHERE pv.poll_id IN ($pin)");
+        $st->execute($pollIds);
+        foreach ($st->fetchAll() as $r) $pollVotes[(int)$r['poll_id']][] = $r;
+        foreach ($pollRows as $poll) {
+            $polls[(int)$poll['message_id']] = poll_payload($poll, $pollVotes[(int)$poll['id']] ?? [], $viewerId);
+        }
+    }
 
     // Messages cités.
     $replyIds = [];
@@ -815,6 +1121,9 @@ function attach_messages(array $rows, int $viewerId, array $members): array
             'media' => $deleted ? null : media_from_joined($r),
             'replyTo' => $reply,
             'reactions' => $reactions[(int)$r['id']] ?? [],
+            'mentions' => $mentions[(int)$r['id']] ?? [],
+            'poll' => $deleted ? null : ($polls[(int)$r['id']] ?? null),
+            'location' => $deleted ? null : location_from_row($r),
             'readCount' => $readCount,
             'deliveredCount' => $deliveredCount,
             'otherCount' => $otherCount,
@@ -943,6 +1252,28 @@ function conversation_summary(array $c, int $viewerId): array
         ];
     }
 
+    $pinnedId = (int)($c['pinned_message_id'] ?? 0);
+    $pinnedJson = null;
+    if ($pinnedId > 0) {
+        $st = db()->prepare('SELECT m.id, m.sender_id, m.type, m.body, m.media_id, m.deleted_at, m.created_at, u.name AS sender_name
+            FROM messages m JOIN users u ON u.id = m.sender_id
+            WHERE m.id = ? AND m.conversation_id = ? LIMIT 1');
+        $st->execute([$pinnedId, $convId]);
+        $pr = $st->fetch();
+        if ($pr) {
+            $pinnedJson = [
+                'id' => (int)$pr['id'],
+                'senderId' => (int)$pr['sender_id'],
+                'senderName' => (string)$pr['sender_name'],
+                'type' => (string)$pr['type'],
+                'body' => (int)$pr['deleted_at'] ? '' : (string)$pr['body'],
+                'mediaId' => !empty($pr['media_id']) ? (int)$pr['media_id'] : null,
+                'createdAt' => (int)$pr['created_at'],
+                'deleted' => (int)$pr['deleted_at'] > 0,
+            ];
+        }
+    }
+
     $blocked = false;
     if ($c['type'] === 'direct' && $peer) {
         $blocked = (bool)$peer['blocked'] || (bool)$peer['blockedBy'];
@@ -989,6 +1320,8 @@ function conversation_summary(array $c, int $viewerId): array
         'onlyAdminsCanPost' => (int)$c['only_admins_can_post'],
         'memberCount' => count($members),
         'lastMessage' => $lastJson,
+        'pinnedMessageId' => $pinnedJson ? $pinnedId : 0,
+        'pinnedMessage' => $pinnedJson,
         'blocked' => $blocked,
     ];
 }
@@ -1348,7 +1681,20 @@ function push_notify_message(array $conv, array $sender, array $message, array $
     if ((string)$message['type'] === 'image') $preview = $preview !== '' ? '📷 ' . $preview : '📷 Photo';
     elseif ((string)$message['type'] === 'voice') $preview = '🎤 Message vocal';
     elseif ((string)$message['type'] === 'file') $preview = '📎 ' . ($preview !== '' ? $preview : 'Fichier');
+    elseif ((string)$message['type'] === 'poll') $preview = '📊 ' . ($preview !== '' ? $preview : 'Sondage');
+    elseif ((string)$message['type'] === 'location') {
+        $loc = location_from_row($message);
+        $live = $loc && (int)$loc['liveUntil'] > now() && (int)$loc['stoppedAt'] === 0;
+        $preview = $live ? '📍 Position en direct' : '📍 Position partagée';
+    }
     $preview = mb_substr($preview, 0, 140);
+    $mentionIds = message_mention_ids((int)$message['id']);
+    $host = (string)($_SERVER['HTTP_HOST'] ?? '');
+    $scheme = ((!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+        || (string)($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https') ? 'https' : 'http';
+    $apiUrl = $host !== '' && preg_match('/^[A-Za-z0-9.\-:\[\]]+$/', $host)
+        ? $scheme . '://' . $host . '/api-messagerie.php'
+        : '';
 
     $subs = [];
     $seenUsers = [];
@@ -1363,8 +1709,13 @@ function push_notify_message(array $conv, array $sender, array $message, array $
         if (!$row) continue;
         $prefs = user_notif(['notif' => $row['notif']]);
         if (!$prefs['enabled'] || !$prefs['messages'] || ($group && !$prefs['groups'])) continue;
+        $mentioned = in_array($uid, $mentionIds, true);
         $body = $prefs['preview'] ? $preview : 'Nouveau message';
-        if ($group) $body = $sender['name'] . ' : ' . $body;
+        if ($mentioned) {
+            $body = $sender['name'] . ' vous a mentionné' . ($prefs['preview'] ? ' : ' . $preview : '');
+        } elseif ($group) {
+            $body = $sender['name'] . ' : ' . $body;
+        }
         $payload = [
             'title' => $title,
             'body' => $body,
@@ -1373,6 +1724,10 @@ function push_notify_message(array $conv, array $sender, array $message, array $
             'tag' => 'pulse-conv-' . (int)$conv['id'],
             'sound' => (bool)$prefs['sound'],
             'renotify' => true,
+            'mention' => $mentioned,
+            'senderName' => (string)$sender['name'],
+            'apiUrl' => $apiUrl,
+            'replyToken' => quick_token($uid, (int)$conv['id'], now() + 7 * 86400),
         ];
         $st = db()->prepare('SELECT * FROM push_subscriptions WHERE user_id = ?');
         $st->execute([$uid]);
@@ -1436,11 +1791,82 @@ function push_notify_message(array $conv, array $sender, array $message, array $
     curl_multi_close($mh);
 }
 
+/** Notification push simple vers un utilisateur (demandes de contact). */
+function push_send_user(int $userId, array $payload): void
+{
+    $st = db()->prepare('SELECT * FROM push_subscriptions WHERE user_id = ?');
+    $st->execute([$userId]);
+    foreach ($st->fetchAll() as $sub) {
+        [$sent, $status, $err] = webpush_send($sub, $payload);
+        if ($status === 404 || $status === 410) {
+            db()->prepare('DELETE FROM push_subscriptions WHERE id = ?')->execute([(int)$sub['id']]);
+        } elseif ($sent) {
+            db()->prepare('UPDATE push_subscriptions SET last_ok = ? WHERE id = ?')->execute([now(), (int)$sub['id']]);
+        } else {
+            db()->prepare('UPDATE push_subscriptions SET last_error = ? WHERE id = ?')
+                ->execute([mb_substr(trim($status . ' ' . $err), 0, 250), (int)$sub['id']]);
+        }
+    }
+}
+
+/**
+ * Réponse rapide depuis une notification (sans session) : le jeton signé
+ * porte l'utilisateur et la conversation, et expire au bout de quelques jours.
+ */
+function quick_reply_action(): void
+{
+    $token = str_input('token', 700);
+    $data = quick_token_verify($token);
+    if (!$data) fail('Ce lien de réponse a expiré. Ouvrez Pulse pour répondre.', 403);
+    [$uid, $cid] = $data;
+    $body = trim(str_input('body', 4000));
+    if ($body === '') fail('Le message est vide.');
+    $st = db()->prepare('SELECT * FROM users WHERE id = ? AND active = 1 LIMIT 1');
+    $st->execute([$uid]);
+    $user = $st->fetch();
+    if (!$user) fail('Compte indisponible.', 403);
+    [$c, $m] = require_conversation($cid, $uid);
+    if (!can_post($c, $m)) fail('Vous ne pouvez pas répondre dans cette conversation.', 403);
+    if ($c['type'] === 'direct') {
+        $st = db()->prepare('SELECT user_id FROM conversation_members WHERE conversation_id = ? AND user_id <> ? LIMIT 1');
+        $st->execute([$cid, $uid]);
+        $peerId = (int)$st->fetchColumn();
+        if ($peerId && (user_is_blocked($uid, $peerId) || user_is_blocked($peerId, $uid))) {
+            fail('Impossible de répondre : un blocage est actif.', 403);
+        }
+    }
+    $expires = (int)$c['disappearing_seconds'] > 0 ? now() + (int)$c['disappearing_seconds'] : 0;
+    $id = create_message($cid, $uid, 'text', $body, null, 0, false, $expires);
+    $members = conversation_members_rows($cid);
+    save_message_mentions($id, resolve_mentions($body, $members, $uid));
+    $row = message_with_joins($id);
+    $sender = ['id' => $uid, 'name' => (string)$user['name']];
+    defer(function () use ($c, $sender, $row, $members): void {
+        push_notify_message($c, $sender, $row, $members);
+    });
+    ok(['messageId' => $id]);
+}
+
+function quick_read_action(): void
+{
+    $token = str_input('token', 700);
+    $data = quick_token_verify($token);
+    if (!$data) fail('Ce lien a expiré.', 403);
+    [$uid, $cid] = $data;
+    [, $m] = require_conversation($cid, $uid);
+    $st = db()->prepare('SELECT MAX(id) FROM messages WHERE conversation_id = ?');
+    $st->execute([$cid]);
+    $max = (int)$st->fetchColumn();
+    db()->prepare('UPDATE conversation_members SET last_read_message_id = ?, last_delivered_message_id = ? WHERE conversation_id = ? AND user_id = ?')
+        ->execute([$max, $max, $cid, $uid]);
+    ok(['lastReadMessageId' => $max]);
+}
+
 // ============================== DISPATCH ==============================
 
 $action = (string)($_GET['action'] ?? $_POST['action'] ?? '');
 
-$PUBLIC_ACTIONS = ['ping', 'bootstrap_status', 'bootstrap', 'login', 'register', 'invite_info', 'push_key'];
+$PUBLIC_ACTIONS = ['ping', 'bootstrap_status', 'bootstrap', 'login', 'register', 'invite_info', 'push_key', 'quick_reply', 'quick_read'];
 
 try {
     if ($action === 'ping') {
@@ -1472,6 +1898,14 @@ try {
         ok(['publicKey' => $keys['public'] ?? '', 'enabled' => (bool)$keys && function_exists('curl_init')]);
     }
 
+    if ($action === 'quick_reply') {
+        quick_reply_action();
+    }
+
+    if ($action === 'quick_read') {
+        quick_read_action();
+    }
+
     // ---- à partir d'ici : session obligatoire ----
     if (!in_array($action, $PUBLIC_ACTIONS, true)) {
         $user = auth();
@@ -1498,6 +1932,20 @@ try {
                 user_search_action($user);
             case 'directory':
                 directory_action($user);
+            case 'contacts_list':
+                contacts_list_action($user);
+            case 'contact_requests_list':
+                contact_requests_list_action($user);
+            case 'contact_request':
+                contact_request_action($user);
+            case 'contact_accept':
+                contact_accept_action($user);
+            case 'contact_decline':
+                contact_decline_action($user);
+            case 'contact_cancel':
+                contact_cancel_action($user);
+            case 'contact_remove':
+                contact_remove_action($user);
             case 'block_user':
                 block_user_action($user, true);
             case 'unblock_user':
@@ -1565,6 +2013,16 @@ try {
                 messages_starred_action($user);
             case 'message_info':
                 message_info_action($user);
+            case 'message_pin':
+                message_pin_action($user);
+            case 'poll_vote':
+                poll_vote_action($user);
+            case 'location_update':
+                message_location_update_action($user);
+            case 'location_stop':
+                message_location_stop_action($user);
+            case 'mentions_list':
+                mentions_list_action($user);
             case 'search_messages':
                 search_messages_action($user);
             case 'search':
@@ -1573,6 +2031,8 @@ try {
                 typing_action($user);
             case 'sync':
                 sync_action($user);
+            case 'stream':
+                stream_action($user);
 
             case 'media_upload':
                 ok(['media' => handle_upload($user)]);
@@ -1732,6 +2192,14 @@ function register_action(): void
         $st = $pdo->prepare('INSERT INTO users(email, username, name, password_hash, role, created_at, last_seen, notif, privacy) VALUES(?,?,?,?,?,?,?,?,?)');
         $st->execute([$email, $username, $name, password_hash($password, PASSWORD_DEFAULT), $role, $t, $t, $notif, $privacy]);
         $id = (int)$pdo->lastInsertId();
+        // L'invitant et le nouvel inscrit sont contacts acceptés d'office.
+        $inviter = (int)$fresh['created_by'];
+        if ($inviter > 0) {
+            $pdo->prepare('INSERT OR IGNORE INTO contacts(user_id, contact_id, created_at) VALUES(?,?,?)')
+                ->execute([$id, $inviter, $t]);
+            $pdo->prepare('INSERT OR IGNORE INTO contacts(user_id, contact_id, created_at) VALUES(?,?,?)')
+                ->execute([$inviter, $id, $t]);
+        }
         $pdo->prepare('UPDATE invites SET uses = uses + 1 WHERE id = ?')->execute([(int)$fresh['id']]);
         $pdo->commit();
     } catch (Throwable $e) {
@@ -1956,6 +2424,171 @@ function directory_action(array $user): void
     ok(['users' => $out]);
 }
 
+function contacts_list_action(array $user): void
+{
+    $st = db()->prepare('SELECT u.* FROM contacts c JOIN users u ON u.id = c.contact_id
+        WHERE c.user_id = ? AND u.active = 1 ORDER BY u.name COLLATE NOCASE LIMIT 300');
+    $st->execute([(int)$user['id']]);
+    $out = [];
+    foreach ($st->fetchAll() as $row) {
+        $u = public_user($row, (int)$user['id']);
+        $d = find_direct_conversation((int)$user['id'], (int)$row['id']);
+        $u['directId'] = $d ? (int)$d['id'] : null;
+        $u['hasDirect'] = $d !== null;
+        $out[] = $u;
+    }
+    usort($out, function ($a, $b) {
+        if ($a['online'] !== $b['online']) return $a['online'] ? -1 : 1;
+        return strcoll(mb_strtolower($a['name']), mb_strtolower($b['name']));
+    });
+    ok(['users' => $out, 'incoming' => contact_request_count((int)$user['id'])]);
+}
+
+function contact_requests_list_action(array $user): void
+{
+    $st = db()->prepare('SELECT u.*, cr.id AS request_id, cr.created_at AS requested_at
+        FROM contact_requests cr JOIN users u ON u.id = cr.from_user_id
+        WHERE cr.to_user_id = ? AND u.active = 1 ORDER BY cr.created_at DESC LIMIT 200');
+    $st->execute([(int)$user['id']]);
+    $incoming = [];
+    foreach ($st->fetchAll() as $row) {
+        $incoming[] = [
+            'id' => (int)$row['request_id'],
+            'createdAt' => (int)$row['requested_at'],
+            'user' => public_user($row, (int)$user['id']),
+        ];
+    }
+    $st = db()->prepare('SELECT u.*, cr.id AS request_id, cr.created_at AS requested_at
+        FROM contact_requests cr JOIN users u ON u.id = cr.to_user_id
+        WHERE cr.from_user_id = ? AND u.active = 1 ORDER BY cr.created_at DESC LIMIT 200');
+    $st->execute([(int)$user['id']]);
+    $outgoing = [];
+    foreach ($st->fetchAll() as $row) {
+        $outgoing[] = [
+            'id' => (int)$row['request_id'],
+            'createdAt' => (int)$row['requested_at'],
+            'user' => public_user($row, (int)$user['id']),
+        ];
+    }
+    ok(['incoming' => $incoming, 'outgoing' => $outgoing]);
+}
+
+function contact_request_action(array $user): void
+{
+    $targetId = int_input('userId');
+    $uid = (int)$user['id'];
+    if ($targetId <= 0 || $targetId === $uid) fail('Utilisateur invalide.');
+    $st = db()->prepare('SELECT * FROM users WHERE id = ? AND active = 1 LIMIT 1');
+    $st->execute([$targetId]);
+    $target = $st->fetch();
+    if (!$target) fail('Utilisateur introuvable.', 404);
+    if (user_is_blocked($uid, $targetId) || user_is_blocked($targetId, $uid)) {
+        fail('Impossible d’envoyer une demande à cet utilisateur.', 403);
+    }
+    if (is_contact($uid, $targetId)) {
+        ok(['status' => 'accepted', 'requestId' => null, 'user' => public_user($target, $uid)]);
+    }
+    $t = now();
+    // Demande inverse déjà en attente : acceptation mutuelle immédiate.
+    $st = db()->prepare('SELECT id FROM contact_requests WHERE from_user_id = ? AND to_user_id = ? LIMIT 1');
+    $st->execute([$targetId, $uid]);
+    $reverseId = (int)$st->fetchColumn();
+    if ($reverseId > 0) {
+        db()->prepare('INSERT OR IGNORE INTO contacts(user_id, contact_id, created_at) VALUES(?,?,?)')->execute([$uid, $targetId, $t]);
+        db()->prepare('INSERT OR IGNORE INTO contacts(user_id, contact_id, created_at) VALUES(?,?,?)')->execute([$targetId, $uid, $t]);
+        db()->prepare('DELETE FROM contact_requests WHERE id = ?')->execute([$reverseId]);
+        defer(function () use ($targetId, $user): void {
+            push_send_user($targetId, [
+                'title' => 'Pulse',
+                'body' => (string)$user['name'] . ' a accepté votre demande de contact',
+                'url' => '#/contacts',
+                'tag' => 'pulse-contact',
+                'sound' => true,
+                'renotify' => true,
+            ]);
+        });
+        ok(['status' => 'accepted', 'requestId' => null, 'user' => public_user($target, $uid)]);
+    }
+    $st = db()->prepare('SELECT id FROM contact_requests WHERE from_user_id = ? AND to_user_id = ? LIMIT 1');
+    $st->execute([$uid, $targetId]);
+    $requestId = (int)$st->fetchColumn();
+    if ($requestId <= 0) {
+        db()->prepare('INSERT INTO contact_requests(from_user_id, to_user_id, created_at) VALUES(?,?,?)')
+            ->execute([$uid, $targetId, $t]);
+        $requestId = (int)db()->lastInsertId();
+        $senderName = (string)$user['name'];
+        defer(function () use ($targetId, $senderName): void {
+            push_send_user($targetId, [
+                'title' => 'Pulse',
+                'body' => $senderName . ' vous envoie une demande de contact',
+                'url' => '#/contacts',
+                'tag' => 'pulse-contact',
+                'sound' => true,
+                'renotify' => true,
+            ]);
+        });
+    }
+    ok(['status' => 'pending_out', 'requestId' => $requestId, 'user' => public_user($target, $uid)]);
+}
+
+function contact_accept_action(array $user): void
+{
+    $id = int_input('requestId');
+    $uid = (int)$user['id'];
+    $st = db()->prepare('SELECT cr.*, u.name AS from_name FROM contact_requests cr
+        JOIN users u ON u.id = cr.from_user_id WHERE cr.id = ? AND cr.to_user_id = ? LIMIT 1');
+    $st->execute([$id, $uid]);
+    $req = $st->fetch();
+    if (!$req) fail('Demande de contact introuvable.', 404);
+    $from = (int)$req['from_user_id'];
+    $t = now();
+    db()->prepare('INSERT OR IGNORE INTO contacts(user_id, contact_id, created_at) VALUES(?,?,?)')->execute([$uid, $from, $t]);
+    db()->prepare('INSERT OR IGNORE INTO contacts(user_id, contact_id, created_at) VALUES(?,?,?)')->execute([$from, $uid, $t]);
+    db()->prepare('DELETE FROM contact_requests WHERE (from_user_id = ? AND to_user_id = ?) OR (from_user_id = ? AND to_user_id = ?)')
+        ->execute([$from, $uid, $uid, $from]);
+    $acceptorName = (string)$user['name'];
+    defer(function () use ($from, $acceptorName): void {
+        push_send_user($from, [
+            'title' => 'Pulse',
+            'body' => $acceptorName . ' a accepté votre demande de contact',
+            'url' => '#/contacts',
+            'tag' => 'pulse-contact',
+            'sound' => true,
+            'renotify' => true,
+        ]);
+    });
+    $st = db()->prepare('SELECT * FROM users WHERE id = ? LIMIT 1');
+    $st->execute([$from]);
+    $row = $st->fetch();
+    ok(['status' => 'accepted', 'userId' => $from, 'user' => $row ? public_user($row, $uid) : null]);
+}
+
+function contact_decline_action(array $user): void
+{
+    $id = int_input('requestId');
+    db()->prepare('DELETE FROM contact_requests WHERE id = ? AND to_user_id = ?')->execute([$id, (int)$user['id']]);
+    ok();
+}
+
+function contact_cancel_action(array $user): void
+{
+    $id = int_input('requestId');
+    db()->prepare('DELETE FROM contact_requests WHERE id = ? AND from_user_id = ?')->execute([$id, (int)$user['id']]);
+    ok();
+}
+
+function contact_remove_action(array $user): void
+{
+    $targetId = int_input('userId');
+    $uid = (int)$user['id'];
+    if ($targetId <= 0 || $targetId === $uid) fail('Utilisateur invalide.');
+    db()->prepare('DELETE FROM contacts WHERE (user_id = ? AND contact_id = ?) OR (user_id = ? AND contact_id = ?)')
+        ->execute([$uid, $targetId, $targetId, $uid]);
+    db()->prepare('DELETE FROM contact_requests WHERE (from_user_id = ? AND to_user_id = ?) OR (from_user_id = ? AND to_user_id = ?)')
+        ->execute([$uid, $targetId, $targetId, $uid]);
+    ok();
+}
+
 function block_user_action(array $user, bool $block): void
 {
     $targetId = int_input('userId');
@@ -2073,6 +2706,9 @@ function conversation_create_direct_action(array $user): void
         db()->prepare('UPDATE conversation_members SET hidden = 0, archived = 0 WHERE conversation_id = ? AND user_id IN (?, ?)')
             ->execute([(int)$existing['id'], (int)$user['id'], $targetId]);
         ok(['conversation' => conversation_summary($existing, (int)$user['id'])]);
+    }
+    if (!is_contact((int)$user['id'], $targetId)) {
+        fail('Demandez d’abord à cette personne de vous ajouter en contact.', 403);
     }
     $pdo = db();
     $pdo->beginTransaction();
@@ -2455,12 +3091,12 @@ function message_by_id(int $id): ?array
     return $r ?: null;
 }
 
-function create_message(int $convId, int $senderId, string $type, string $body, ?int $mediaId, int $replyTo, bool $forwarded, int $expiresAt): int
+function create_message(int $convId, int $senderId, string $type, string $body, ?int $mediaId, int $replyTo, bool $forwarded, int $expiresAt, string $meta = '{}'): int
 {
     $t = now();
-    $st = db()->prepare('INSERT INTO messages(conversation_id, sender_id, type, body, media_id, reply_to, forwarded, created_at, updated_at, expires_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?)');
-    $st->execute([$convId, $senderId, $type, $body, $mediaId, $replyTo, $forwarded ? 1 : 0, $t, $t, $expiresAt]);
+    $st = db()->prepare('INSERT INTO messages(conversation_id, sender_id, type, body, media_id, reply_to, forwarded, created_at, updated_at, expires_at, meta)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?)');
+    $st->execute([$convId, $senderId, $type, $body, $mediaId, $replyTo, $forwarded ? 1 : 0, $t, $t, $expiresAt, $meta]);
     $id = (int)db()->lastInsertId();
     db()->prepare('UPDATE conversations SET last_message_id = ?, updated_at = ? WHERE id = ?')->execute([$id, $t, $convId]);
     db()->prepare('UPDATE conversation_members SET hidden = 0 WHERE conversation_id = ?')->execute([$convId]);
@@ -2539,11 +3175,15 @@ function message_send_action(array $user): void
         }
     }
     $type = (string)p('type', 'text');
-    if (!in_array($type, ['text', 'image', 'voice', 'file'], true)) fail('Type de message invalide.');
+    if (!in_array($type, ['text', 'image', 'voice', 'file', 'poll', 'location'], true)) fail('Type de message invalide.');
     $body = str_input('body', 4000);
     $mediaId = int_input('mediaId');
     $replyTo = int_input('replyTo');
     $media = null;
+    $meta = '{}';
+    $pollOptions = [];
+    $pollKind = 'choice';
+    $pollMultiple = 0;
     if (in_array($type, ['image', 'voice', 'file'], true)) {
         if ($mediaId <= 0) fail('Média manquant.');
         $st = db()->prepare('SELECT * FROM media WHERE id = ? AND user_id = ?');
@@ -2555,6 +3195,61 @@ function message_send_action(array $user): void
         if ($type === 'file' && $media['kind'] !== 'file') fail('Ce média n’est pas un fichier.');
         if ($body === '' && $type === 'file') $body = (string)$media['orig_name'];
     }
+    if ($type === 'poll') {
+        $poll = p('poll', null);
+        if (!is_array($poll)) fail('Sondage invalide.');
+        $kind = in_array((string)($poll['kind'] ?? 'choice'), ['choice', 'dates'], true)
+            ? (string)($poll['kind'] ?? 'choice') : 'choice';
+        $pollKind = $kind;
+        $pollMultiple = ($kind === 'dates' || !empty($poll['multiple'])) ? 1 : 0;
+        $question = trim((string)($poll['question'] ?? $body));
+        if ($kind === 'dates' && $question === '') $question = 'Quand êtes-vous disponible ?';
+        if ($question === '' || mb_strlen($question) > 300) fail('Question du sondage invalide (300 caractères max).');
+        $rawOptions = $poll['options'] ?? [];
+        if (!is_array($rawOptions)) fail('Options du sondage invalides.');
+        $pollOptions = [];
+        $seenAt = [];
+        foreach ($rawOptions as $opt) {
+            $text = is_array($opt) ? trim((string)($opt['text'] ?? '')) : trim((string)$opt);
+            $at = is_array($opt) ? (int)($opt['at'] ?? 0) : 0;
+            if ($text === '') continue;
+            if ($kind === 'dates') {
+                if ($at <= 0) fail('Chaque date proposée doit être valide.');
+                if (isset($seenAt[$at])) continue;
+                $seenAt[$at] = true;
+            }
+            $pollOptions[] = ['text' => mb_substr($text, 0, 120), 'at' => $at];
+        }
+        if ($kind === 'dates') {
+            usort($pollOptions, fn($a, $b) => $a['at'] <=> $b['at']);
+            if (count($pollOptions) < 2) fail('Proposez au moins deux dates.');
+            if (count($pollOptions) > 20) fail('20 dates maximum.');
+        } else {
+            if (count($pollOptions) < 2) fail('Ajoutez au moins deux options.');
+            if (count($pollOptions) > 10) fail('10 options maximum.');
+        }
+        $body = $question;
+    }
+    if ($type === 'location') {
+        $loc = p('location', null);
+        if (!is_array($loc)) fail('Position invalide.');
+        $lat = (float)($loc['lat'] ?? 999);
+        $lng = (float)($loc['lng'] ?? 999);
+        if ($lat < -90 || $lat > 90 || $lng < -180 || $lng > 180) fail('Coordonnées invalides.');
+        $accuracy = max(0, (float)($loc['accuracy'] ?? 0));
+        $seconds = (int)($loc['liveSeconds'] ?? 0);
+        if (!in_array($seconds, [0, 900, 3600], true)) $seconds = 0;
+        $t = now();
+        $meta = json_encode([
+            'lat' => $lat,
+            'lng' => $lng,
+            'accuracy' => $accuracy,
+            'liveUntil' => $seconds > 0 ? $t + $seconds : 0,
+            'stoppedAt' => 0,
+            'updatedAt' => $t,
+        ], JSON_UNESCAPED_UNICODE);
+        $body = '';
+    }
     if ($type === 'text' && $body === '') fail('Le message est vide.');
     if ($replyTo > 0) {
         $st = db()->prepare('SELECT id FROM messages WHERE id = ? AND conversation_id = ?');
@@ -2564,9 +3259,16 @@ function message_send_action(array $user): void
     $expiresAt = 0;
     if ((int)$c['disappearing_seconds'] > 0) $expiresAt = now() + (int)$c['disappearing_seconds'];
 
-    $id = create_message($cid, (int)$user['id'], $type, $body, $mediaId > 0 ? $mediaId : null, $replyTo, false, $expiresAt);
-    $row = message_with_joins($id);
+    $id = create_message($cid, (int)$user['id'], $type, $body, $mediaId > 0 ? $mediaId : null, $replyTo, false, $expiresAt, $meta);
     $members = conversation_members_rows($cid);
+    if ($type === 'poll') {
+        db()->prepare('INSERT INTO polls(message_id, conversation_id, question, options, kind, multiple, created_at) VALUES(?,?,?,?,?,?,?)')
+            ->execute([$id, $cid, $body, json_encode($pollOptions, JSON_UNESCAPED_UNICODE), $pollKind, $pollMultiple, now()]);
+    }
+    if ($type === 'text') {
+        save_message_mentions($id, resolve_mentions($body, $members, (int)$user['id']));
+    }
+    $row = message_with_joins($id);
     $message = attach_messages([$row], (int)$user['id'], $members)[0];
     $c = conversation_row($cid);
     $sender = ['id' => (int)$user['id'], 'name' => (string)$user['name']];
@@ -2589,10 +3291,122 @@ function message_edit_action(array $user): void
     if ($body === '') fail('Le message est vide.');
     if (now() - (int)$m['created_at'] > 900) fail('Il est trop tard pour modifier ce message (15 min).', 403);
     db()->prepare('UPDATE messages SET body = ?, edited_at = ?, updated_at = ? WHERE id = ?')->execute([$body, now(), now(), $id]);
+    $members = conversation_members_rows((int)$m['conversation_id']);
+    save_message_mentions($id, resolve_mentions($body, $members, (int)$user['id']));
+    touch_conversation((int)$m['conversation_id']);
+    $row = message_with_joins($id);
+    ok(['message' => attach_messages([$row], (int)$user['id'], $members)[0]]);
+}
+
+function message_pin_action(array $user): void
+{
+    $id = int_input('messageId');
+    $pinned = bool_input('pinned', true);
+    $m = message_by_id($id);
+    if (!$m) fail('Message introuvable.', 404);
+    [$c, $member] = require_conversation((int)$m['conversation_id'], (int)$user['id']);
+    if ((string)$m['type'] === 'system') fail('Ce message ne peut pas être épinglé.');
+    if ($pinned && (int)$m['deleted_at'] > 0) fail('Impossible d’épingler un message supprimé.');
+    if ($c['type'] === 'group' && !is_group_admin($member)) {
+        fail('Seuls les administrateurs peuvent épingler un message dans ce groupe.', 403);
+    }
+    $current = (int)($c['pinned_message_id'] ?? 0);
+    if (!$pinned && $current !== $id) {
+        ok(['pinnedMessageId' => $current]);
+    }
+    $value = $pinned ? $id : 0;
+    db()->prepare('UPDATE conversations SET pinned_message_id = ?, updated_at = ? WHERE id = ?')
+        ->execute([$value, now(), (int)$m['conversation_id']]);
+    touch_conversation((int)$m['conversation_id']);
+    ok(['pinnedMessageId' => $value]);
+}
+
+function poll_vote_action(array $user): void
+{
+    $id = int_input('messageId');
+    $option = int_input('optionIndex', -1);
+    $m = message_by_id($id);
+    if (!$m || (string)$m['type'] !== 'poll') fail('Sondage introuvable.', 404);
+    require_conversation((int)$m['conversation_id'], (int)$user['id']);
+    if ((int)$m['deleted_at'] > 0) fail('Ce sondage a été supprimé.');
+    $st = db()->prepare('SELECT * FROM polls WHERE message_id = ? LIMIT 1');
+    $st->execute([$id]);
+    $poll = $st->fetch();
+    if (!$poll) fail('Sondage introuvable.', 404);
+    $options = json_decode((string)$poll['options'], true);
+    if (!is_array($options) || $option < 0 || $option >= count($options)) fail('Option invalide.');
+    $multiple = (string)($poll['kind'] ?? 'choice') === 'dates' || (int)($poll['multiple'] ?? 0) === 1;
+    if ($multiple) {
+        $st = db()->prepare('SELECT 1 FROM poll_votes WHERE poll_id = ? AND user_id = ? AND option_index = ?');
+        $st->execute([(int)$poll['id'], (int)$user['id'], $option]);
+        if ($st->fetchColumn()) {
+            db()->prepare('DELETE FROM poll_votes WHERE poll_id = ? AND user_id = ? AND option_index = ?')
+                ->execute([(int)$poll['id'], (int)$user['id'], $option]);
+        } else {
+            db()->prepare('INSERT OR IGNORE INTO poll_votes(poll_id, user_id, option_index, created_at) VALUES(?,?,?,?)')
+                ->execute([(int)$poll['id'], (int)$user['id'], $option, now()]);
+        }
+    } else {
+        $st = db()->prepare('SELECT option_index FROM poll_votes WHERE poll_id = ? AND user_id = ?');
+        $st->execute([(int)$poll['id'], (int)$user['id']]);
+        $current = $st->fetchColumn();
+        db()->prepare('DELETE FROM poll_votes WHERE poll_id = ? AND user_id = ?')->execute([(int)$poll['id'], (int)$user['id']]);
+        if ($current === false || (int)$current !== $option) {
+            db()->prepare('INSERT OR IGNORE INTO poll_votes(poll_id, user_id, option_index, created_at) VALUES(?,?,?,?)')
+                ->execute([(int)$poll['id'], (int)$user['id'], $option, now()]);
+        }
+    }
+    db()->prepare('UPDATE messages SET updated_at = ? WHERE id = ?')->execute([now(), $id]);
+    touch_conversation((int)$m['conversation_id']);
+    $st = db()->prepare('SELECT pv.user_id, pv.option_index, u.name FROM poll_votes pv JOIN users u ON u.id = pv.user_id WHERE pv.poll_id = ?');
+    $st->execute([(int)$poll['id']]);
+    ok(['messageId' => $id, 'poll' => poll_payload($poll, $st->fetchAll(), (int)$user['id'])]);
+}
+
+function message_location_update_action(array $user): void
+{
+    $id = int_input('messageId');
+    $m = message_by_id($id);
+    if (!$m || (string)$m['type'] !== 'location') fail('Position introuvable.', 404);
+    require_conversation((int)$m['conversation_id'], (int)$user['id']);
+    if ((int)$m['sender_id'] !== (int)$user['id']) fail('Seul l’auteur peut actualiser cette position.', 403);
+    $meta = message_meta($m);
+    if ((int)($meta['liveUntil'] ?? 0) <= now() || (int)($meta['stoppedAt'] ?? 0) > 0) {
+        fail('Cette position en direct est terminée.', 403);
+    }
+    $lat = (float)p('lat', 999);
+    $lng = (float)p('lng', 999);
+    if ($lat < -90 || $lat > 90 || $lng < -180 || $lng > 180) fail('Coordonnées invalides.');
+    $meta['lat'] = $lat;
+    $meta['lng'] = $lng;
+    $meta['accuracy'] = max(0, (float)p('accuracy', 0));
+    $meta['updatedAt'] = now();
+    db()->prepare('UPDATE messages SET meta = ?, updated_at = ? WHERE id = ?')
+        ->execute([json_encode($meta, JSON_UNESCAPED_UNICODE), now(), $id]);
     touch_conversation((int)$m['conversation_id']);
     $row = message_with_joins($id);
     $members = conversation_members_rows((int)$m['conversation_id']);
-    ok(['message' => attach_messages([$row], (int)$user['id'], $members)[0]]);
+    ok(['location' => location_from_row($row), 'message' => attach_messages([$row], (int)$user['id'], $members)[0]]);
+}
+
+function message_location_stop_action(array $user): void
+{
+    $id = int_input('messageId');
+    $m = message_by_id($id);
+    if (!$m || (string)$m['type'] !== 'location') fail('Position introuvable.', 404);
+    require_conversation((int)$m['conversation_id'], (int)$user['id']);
+    if ((int)$m['sender_id'] !== (int)$user['id']) fail('Seul l’auteur peut arrêter cette position.', 403);
+    $meta = message_meta($m);
+    $t = now();
+    $meta['stoppedAt'] = $t;
+    $meta['liveUntil'] = $t;
+    $meta['updatedAt'] = $t;
+    db()->prepare('UPDATE messages SET meta = ?, updated_at = ? WHERE id = ?')
+        ->execute([json_encode($meta, JSON_UNESCAPED_UNICODE), $t, $id]);
+    touch_conversation((int)$m['conversation_id']);
+    $row = message_with_joins($id);
+    $members = conversation_members_rows((int)$m['conversation_id']);
+    ok(['location' => location_from_row($row), 'message' => attach_messages([$row], (int)$user['id'], $members)[0]]);
 }
 
 function message_delete_action(array $user): void
@@ -2611,9 +3425,14 @@ function message_delete_action(array $user): void
     }
     if (!$isMine && !$canModerate) fail('Action non autorisée.', 403);
     $mediaId = (int)$m['media_id'];
-    db()->prepare('UPDATE messages SET deleted_at = ?, body = \'\', media_id = NULL, updated_at = ? WHERE id = ?')->execute([now(), now(), $id]);
+    db()->prepare('UPDATE messages SET deleted_at = ?, body = \'\', media_id = NULL, meta = \'{}\', updated_at = ? WHERE id = ?')->execute([now(), now(), $id]);
     db()->prepare('DELETE FROM reactions WHERE message_id = ?')->execute([$id]);
     db()->prepare('DELETE FROM stars WHERE message_id = ?')->execute([$id]);
+    db()->prepare('DELETE FROM message_mentions WHERE message_id = ?')->execute([$id]);
+    db()->prepare('DELETE FROM poll_votes WHERE poll_id IN (SELECT id FROM polls WHERE message_id = ?)')->execute([$id]);
+    db()->prepare('DELETE FROM polls WHERE message_id = ?')->execute([$id]);
+    db()->prepare('UPDATE conversations SET pinned_message_id = 0 WHERE id = ? AND pinned_message_id = ?')
+        ->execute([(int)$m['conversation_id'], $id]);
     if ($mediaId > 0) {
         $st = db()->prepare('SELECT COUNT(*) FROM messages WHERE media_id = ?');
         $st->execute([$mediaId]);
@@ -2646,6 +3465,9 @@ function message_forward_action(array $user): void
     if (!$m) fail('Message introuvable.', 404);
     require_conversation((int)$m['conversation_id'], (int)$user['id']);
     if ((int)$m['deleted_at'] > 0) fail('Ce message a été supprimé.');
+    if (!in_array((string)$m['type'], ['text', 'image', 'voice', 'file'], true)) {
+        fail('Ce type de message ne peut pas être transféré.');
+    }
     $ids = p('conversationIds', []);
     if (!is_array($ids)) fail('Destination manquante.');
     $ids = array_values(array_unique(array_filter(array_map('intval', $ids), fn($v) => $v > 0)));
@@ -2662,8 +3484,11 @@ function message_forward_action(array $user): void
         }
         $expires = (int)$c['disappearing_seconds'] > 0 ? now() + (int)$c['disappearing_seconds'] : 0;
         $newId = create_message($cid, (int)$user['id'], (string)$m['type'], (string)$m['body'], $m['media_id'] ? (int)$m['media_id'] : null, 0, true, $expires);
-        $row = message_with_joins($newId);
         $members = conversation_members_rows($cid);
+        if ((string)$m['type'] === 'text') {
+            save_message_mentions($newId, resolve_mentions((string)$m['body'], $members, (int)$user['id']));
+        }
+        $row = message_with_joins($newId);
         $created[] = attach_messages([$row], (int)$user['id'], $members)[0];
         $c = conversation_row($cid);
         $sender = ['id' => (int)$user['id'], 'name' => (string)$user['name']];
@@ -2749,6 +3574,42 @@ function messages_starred_action(array $user): void
             $out[] = $msg;
         }
     }
+    ok(['messages' => $out]);
+}
+
+function mentions_list_action(array $user): void
+{
+    $st = db()->prepare("SELECT m.*, u.name AS sender_name, u.username AS sender_username, u.avatar_id AS sender_avatar_id,
+            md.id AS md_id, md.kind AS md_kind, md.mime AS md_mime, md.size AS md_size,
+            md.width AS md_width, md.height AS md_height, md.duration AS md_duration,
+            md.filename AS md_filename, md.orig_name AS md_orig_name, md.waveform AS md_waveform
+        FROM message_mentions mm
+        JOIN messages m ON m.id = mm.message_id
+        JOIN conversation_members cm ON cm.conversation_id = m.conversation_id AND cm.user_id = mm.user_id AND cm.hidden = 0
+        JOIN conversations c ON c.id = m.conversation_id AND c.deleted = 0
+        JOIN users u ON u.id = m.sender_id
+        LEFT JOIN media md ON md.id = m.media_id
+        WHERE mm.user_id = ? AND m.deleted_at = 0 AND m.id > cm.cleared_before
+          AND m.type <> 'system'
+          AND (m.expires_at = 0 OR m.expires_at > ?)
+          AND NOT EXISTS (SELECT 1 FROM message_hidden mh WHERE mh.message_id = m.id AND mh.user_id = ?)
+        ORDER BY m.id DESC LIMIT 100");
+    $st->execute([(int)$user['id'], now(), (int)$user['id']]);
+    $rows = $st->fetchAll();
+    $grouped = [];
+    foreach ($rows as $r) $grouped[(int)$r['conversation_id']][] = $r;
+    $titles = [];
+    $out = [];
+    foreach ($grouped as $cid => $list) {
+        $members = conversation_members_rows($cid);
+        $msgs = attach_messages($list, (int)$user['id'], $members);
+        $title = conversation_title_for($cid, (int)$user['id'], $titles);
+        foreach ($msgs as $msg) {
+            $msg['conversationTitle'] = $title;
+            $out[] = $msg;
+        }
+    }
+    usort($out, fn($a, $b) => $b['id'] <=> $a['id']);
     ok(['messages' => $out]);
 }
 
@@ -2879,11 +3740,26 @@ function typing_action(array $user): void
 
 function sync_action(array $user): void
 {
+    ok(sync_payload($user, [
+        'since' => int_input('since'),
+        'conversationId' => int_input('conversationId'),
+        'afterMessageId' => int_input('afterMessageId'),
+        'updatesSince' => int_input('updatesSince'),
+        'presence' => p('presence', []),
+    ]));
+}
+
+/**
+ * Charge utile commune au polling (`sync`) et au flux SSE (`stream`).
+ */
+function sync_payload(array $user, array $opts): array
+{
     $uid = (int)$user['id'];
-    $since = int_input('since');
-    $cid = int_input('conversationId');
-    $after = int_input('afterMessageId');
-    $updatesSince = int_input('updatesSince');
+    $since = max(0, (int)($opts['since'] ?? 0));
+    $cid = max(0, (int)($opts['conversationId'] ?? 0));
+    $after = max(0, (int)($opts['afterMessageId'] ?? 0));
+    $updatesSince = max(0, (int)($opts['updatesSince'] ?? 0));
+    $presenceIds = $opts['presence'] ?? [];
     $convs = conv_changed_since($uid, $since);
 
     // Événements récents toutes conversations (pour les notifications locales).
@@ -2962,7 +3838,7 @@ function sync_action(array $user): void
     }
 
     $presence = [];
-    $ids = p('presence', []);
+    $ids = $presenceIds;
     if (is_array($ids)) {
         $ids = array_slice(array_values(array_filter(array_map('intval', $ids), fn($v) => $v > 0)), 0, 100);
         foreach ($ids as $pid) {
@@ -2975,9 +3851,13 @@ function sync_action(array $user): void
         }
     }
 
-    ok([
+    return [
         'now' => now(),
-        'me' => ['unreadTotal' => unread_total($uid), 'lastSeen' => now()],
+        'me' => [
+            'unreadTotal' => unread_total($uid),
+            'contactRequests' => contact_request_count($uid),
+            'lastSeen' => now(),
+        ],
         'conversations' => $convs,
         'events' => $events,
         'messages' => $messages,
@@ -2985,7 +3865,132 @@ function sync_action(array $user): void
         'typing' => $typing,
         'presence' => $presence,
         'readStates' => $readStates,
+    ];
+}
+
+/**
+ * Empreinte légère de l'état visible : n'émet un événement SSE que si
+ * quelque chose a changé depuis le dernier tick.
+ */
+function sync_signature(int $userId, int $cid): string
+{
+    $pdo = db();
+    $conv = $pdo->query('SELECT COUNT(*) AS n, COALESCE(SUM(deleted), 0) AS del, MAX(updated_at) AS upd FROM conversations')->fetch() ?: [];
+    $msg = $pdo->query('SELECT MAX(id) AS max_id, MAX(updated_at) AS upd FROM messages')->fetch() ?: [];
+    $mem = $pdo->query('SELECT COUNT(*) AS n, MAX(last_read_message_id) AS r, MAX(last_delivered_message_id) AS d,
+            MAX(cleared_before) AS c, MAX(joined_at) AS j, MAX(muted_until) AS mu, MAX(pinned) AS p,
+            MAX(archived) AS a, COALESCE(SUM(hidden), 0) AS h FROM conversation_members')->fetch() ?: [];
+    $st = $pdo->prepare('SELECT COUNT(*) FROM contact_requests WHERE to_user_id = ?');
+    $st->execute([$userId]);
+    $requests = (int)$st->fetchColumn();
+    // Présence des autres utilisateurs (sa propre activité ne doit pas déclencher d'émission).
+    $st = $pdo->prepare('SELECT MAX(last_seen) FROM users WHERE id <> ?');
+    $st->execute([$userId]);
+    $presence = (int)$st->fetchColumn();
+    $typing = 0;
+    if ($cid > 0) {
+        $st = $pdo->prepare('SELECT MAX(until) FROM typing WHERE conversation_id = ? AND until > ?');
+        $st->execute([$cid, now()]);
+        $typing = (int)$st->fetchColumn();
+    }
+    return implode(':', [
+        (int)($conv['n'] ?? 0), (int)($conv['del'] ?? 0), (int)($conv['upd'] ?? 0),
+        (int)($msg['max_id'] ?? 0), (int)($msg['upd'] ?? 0),
+        (int)($mem['n'] ?? 0), (int)($mem['r'] ?? 0), (int)($mem['d'] ?? 0),
+        (int)($mem['c'] ?? 0), (int)($mem['j'] ?? 0), (int)($mem['mu'] ?? 0),
+        (int)($mem['p'] ?? 0), (int)($mem['a'] ?? 0), (int)($mem['h'] ?? 0),
+        $requests, $presence, $typing,
     ]);
+}
+
+/**
+ * Flux temps réel Server-Sent Events.
+ *
+ * EventSource ne permet pas d'envoyer d'en-tête : le jeton passe par
+ * `?session=`. La connexion est volontairement courte (STREAM_TTL) pour
+ * rester compatible avec Apache/mod_php et les proxys ; le client la
+ * renouvelle automatiquement, et le polling `sync` sert de secours.
+ */
+function stream_action(array $user): void
+{
+    @ini_set('zlib.output_compression', '0');
+    @ini_set('output_buffering', '0');
+    @ini_set('implicit_flush', '1');
+    @set_time_limit(STREAM_TTL + 10);
+    if (function_exists('apache_setenv')) @apache_setenv('no-gzip', '1');
+    while (ob_get_level() > 0) @ob_end_clean();
+
+    header('Content-Type: text/event-stream; charset=utf-8');
+    header('Cache-Control: no-cache, no-store, must-revalidate');
+    header('X-Accel-Buffering: no');
+
+    $uid = (int)$user['id'];
+    $since = max(0, int_input('since'));
+    $cid = max(0, int_input('conversationId'));
+    $after = max(0, int_input('afterMessageId'));
+    $updatesSince = max(0, int_input('updatesSince'));
+
+    // La présence est dérivée de la conversation : pas besoin de la passer en query.
+    $presence = [];
+    if ($cid > 0) {
+        foreach (conversation_members_rows($cid) as $member) $presence[] = (int)$member['user_id'];
+    }
+
+    echo "retry: 2500\n\n";
+    sse_event('ready', ['now' => now(), 'ttl' => STREAM_TTL]);
+
+    $deadline = microtime(true) + STREAM_TTL;
+    $lastSignature = '';
+    $lastPing = microtime(true);
+
+    while (!connection_aborted() && microtime(true) < $deadline) {
+        try {
+            $signature = sync_signature($uid, $cid);
+            if ($signature !== $lastSignature) {
+                $payload = sync_payload($user, [
+                    'since' => $since,
+                    'conversationId' => $cid,
+                    'afterMessageId' => $after,
+                    'updatesSince' => $updatesSince,
+                    'presence' => $presence,
+                ]);
+                sse_event('sync', $payload);
+                $lastSignature = $signature;
+                // Avance les curseurs côté serveur : inutile de renvoyer deux fois.
+                $since = max((int)$payload['now'] - 1, $since);
+                $updatesSince = max((int)$payload['now'] - 1, $updatesSince);
+                foreach (($payload['messages'] ?? []) as $message) {
+                    $after = max($after, (int)$message['id']);
+                }
+            }
+        } catch (Throwable $e) {
+            @file_put_contents(
+                dirname(DB_FILE) . '/error.log',
+                '[' . date('c') . '] stream : ' . $e->getMessage() . "\n",
+                FILE_APPEND
+            );
+            usleep(300000);
+        }
+
+        if (microtime(true) - $lastPing >= 10) {
+            echo ": ping\n\n";
+            @flush();
+            $lastPing = microtime(true);
+        }
+        usleep(STREAM_TICK_MS * 1000);
+    }
+
+    sse_event('end', ['now' => now()]);
+    exit;
+}
+
+/** Écrit un événement SSE et pousse immédiatement vers le client. */
+function sse_event(string $event, array $data): void
+{
+    echo 'event: ' . $event . "\n";
+    echo 'data: ' . json_encode($data, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) . "\n\n";
+    if (ob_get_level() > 0) @ob_flush();
+    @flush();
 }
 
 // ============================== MEDIA GET ==============================

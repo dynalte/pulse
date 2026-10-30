@@ -1,7 +1,10 @@
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { useHistory } from 'react-router-dom';
 import { IonIcon } from '@ionic/react';
-import { chatbubbleOutline, copyOutline, banOutline, checkmarkCircle, peopleOutline, settingsOutline } from 'ionicons/icons';
+import {
+  chatbubbleOutline, copyOutline, banOutline, checkmarkCircle, peopleOutline, settingsOutline,
+  personAddOutline, closeCircle, hourglassOutline,
+} from 'ionicons/icons';
 import { accountApi, chatApi } from '../services/api';
 import { useApp } from '../context/AppContext';
 import { copyText, formatTime, lastSeenLabel } from '../services/utils';
@@ -16,12 +19,13 @@ interface CommonGroup {
 }
 
 export function UserProfileModal({
-  userId, open, onClose, onOpenChat,
+  userId, open, onClose, onOpenChat, onChanged,
 }: {
   userId: number | null;
   open: boolean;
   onClose: () => void;
   onOpenChat?: (id: number) => void;
+  onChanged?: () => void;
 }) {
   const { me, toast } = useApp();
   const history = useHistory();
@@ -31,8 +35,22 @@ export function UserProfileModal({
   const [confirmBlock, setConfirmBlock] = useState(false);
   const [busy, setBusy] = useState(false);
 
+  const loadProfile = useCallback(async (silent = false) => {
+    if (!userId) return;
+    if (!silent) setLoading(true);
+    try {
+      const res = await accountApi.profileGet(userId);
+      setUser(res.user);
+      setGroups((res.groups as CommonGroup[]) || []);
+    } catch (e) {
+      toast({ title: 'Profil indisponible', body: (e as Error).message, tone: 'error' });
+    } finally {
+      if (!silent) setLoading(false);
+    }
+  }, [userId, toast]);
+
   useEffect(() => {
-    if (!open || !userId) return;
+    if (!open || !userId) return undefined;
     let alive = true;
     setLoading(true);
     setUser(null);
@@ -49,6 +67,8 @@ export function UserProfileModal({
 
   if (!open || !userId) return null;
   const isSelf = me?.id === userId;
+  const contactStatus = user?.contactStatus ?? 'none';
+  const canMessage = contactStatus === 'accepted' || !!user?.directId;
 
   const openChat = async (directId?: number | null) => {
     if (directId) {
@@ -76,6 +96,71 @@ export function UserProfileModal({
       else await accountApi.block(user.id);
       setUser({ ...user, blocked: !user.blocked });
       toast({ title: user.blocked ? 'Utilisateur débloqué' : 'Utilisateur bloqué', tone: 'success' });
+    } catch (e) {
+      toast({ title: 'Action impossible', body: (e as Error).message, tone: 'error' });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const requestContact = async () => {
+    if (!user) return;
+    setBusy(true);
+    try {
+      const res = await accountApi.requestContact(user.id);
+      setUser({
+        ...user,
+        contactStatus: res.status === 'accepted' ? 'accepted' : 'pending_out',
+        isContact: res.status === 'accepted',
+        contactRequestId: res.requestId,
+      });
+      toast({ title: res.status === 'accepted' ? 'Contact ajouté' : 'Demande envoyée', tone: 'success' });
+      onChanged?.();
+    } catch (e) {
+      toast({ title: 'Demande impossible', body: (e as Error).message, tone: 'error' });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const acceptContactRequest = async () => {
+    if (!user || !user.contactRequestId) return;
+    setBusy(true);
+    try {
+      await accountApi.acceptContact(user.contactRequestId);
+      await loadProfile(true);
+      toast({ title: 'Demande acceptée', tone: 'success' });
+      onChanged?.();
+    } catch (e) {
+      toast({ title: 'Acceptation impossible', body: (e as Error).message, tone: 'error' });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const declineContactRequest = async () => {
+    if (!user || !user.contactRequestId) return;
+    setBusy(true);
+    try {
+      await accountApi.declineContact(user.contactRequestId);
+      await loadProfile(true);
+      toast({ title: 'Demande refusée', tone: 'success' });
+      onChanged?.();
+    } catch (e) {
+      toast({ title: 'Action impossible', body: (e as Error).message, tone: 'error' });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const cancelContactRequest = async () => {
+    if (!user || !user.contactRequestId) return;
+    setBusy(true);
+    try {
+      await accountApi.cancelContact(user.contactRequestId);
+      await loadProfile(true);
+      toast({ title: 'Demande annulée', tone: 'success' });
+      onChanged?.();
     } catch (e) {
       toast({ title: 'Action impossible', body: (e as Error).message, tone: 'error' });
     } finally {
@@ -144,14 +229,51 @@ export function UserProfileModal({
                 </button>
               ) : (
                 <>
-                  <button
-                    type="button"
-                    className="btn primary block"
-                    onClick={() => void openChat(user.directId)}
-                    disabled={busy || user.blocked || user.blockedBy}
-                  >
-                    <IonIcon icon={chatbubbleOutline} /> Envoyer un message
-                  </button>
+                  {canMessage && (
+                    <button
+                      type="button"
+                      className="btn primary block"
+                      onClick={() => void openChat(user.directId)}
+                      disabled={busy || user.blocked || user.blockedBy}
+                    >
+                      <IonIcon icon={chatbubbleOutline} /> Envoyer un message
+                    </button>
+                  )}
+                  {!canMessage && contactStatus === 'pending_in' && (
+                    <>
+                      <button
+                        type="button"
+                        className="btn primary block"
+                        onClick={() => void acceptContactRequest()}
+                        disabled={busy || user.blocked || user.blockedBy}
+                      >
+                        <IonIcon icon={checkmarkCircle} /> Accepter la demande
+                      </button>
+                      <button type="button" className="btn ghost block" onClick={() => void declineContactRequest()} disabled={busy}>
+                        <IonIcon icon={closeCircle} /> Refuser la demande
+                      </button>
+                    </>
+                  )}
+                  {!canMessage && contactStatus === 'pending_out' && (
+                    <>
+                      <button type="button" className="btn soft block" disabled>
+                        <IonIcon icon={hourglassOutline} /> Demande envoyée
+                      </button>
+                      <button type="button" className="btn ghost block" onClick={() => void cancelContactRequest()} disabled={busy}>
+                        Annuler la demande
+                      </button>
+                    </>
+                  )}
+                  {!canMessage && contactStatus === 'none' && (
+                    <button
+                      type="button"
+                      className="btn primary block"
+                      onClick={() => void requestContact()}
+                      disabled={busy || user.blocked || user.blockedBy}
+                    >
+                      <IonIcon icon={personAddOutline} /> Demander en contact
+                    </button>
+                  )}
                   <button type="button" className="btn ghost block" onClick={() => setConfirmBlock(true)} disabled={busy}>
                     <IonIcon icon={user.blocked ? checkmarkCircle : banOutline} />
                     {user.blocked ? 'Débloquer' : 'Bloquer'}

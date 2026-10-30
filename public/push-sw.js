@@ -9,6 +9,7 @@ self.addEventListener('push', (event) => {
   }
   const title = data.title || 'Pulse';
   const scope = self.registration.scope;
+  const canReply = !!data.replyToken && !!data.apiUrl;
   const options = {
     body: data.body || 'Nouveau message',
     icon: scope + 'pwa-192x192.png',
@@ -20,8 +21,16 @@ self.addEventListener('push', (event) => {
     data: {
       url: scope + (data.url || '#/'),
       conversationId: data.conversationId || null,
+      replyToken: data.replyToken || '',
+      apiUrl: data.apiUrl || '',
+      senderName: data.senderName || '',
     },
-    actions: [{ action: 'open', title: 'Ouvrir' }],
+    actions: canReply
+      ? [
+          { action: 'reply', title: 'Répondre' },
+          { action: 'read', title: 'Marquer lu' },
+        ]
+      : [{ action: 'open', title: 'Ouvrir' }],
   };
   event.waitUntil((async () => {
     // Ne pas doubler les notifications si l'app est réellement visible :
@@ -40,7 +49,37 @@ self.addEventListener('push', (event) => {
 
 self.addEventListener('notificationclick', (event) => {
   event.notification.close();
-  const target = (event.notification.data && event.notification.data.url) || self.registration.scope;
+  const info = event.notification.data || {};
+  const action = event.action || 'open';
+  const target = info.url || self.registration.scope;
+
+  if (action === 'read' && info.replyToken && info.apiUrl) {
+    event.waitUntil(
+      fetch(`${info.apiUrl}?action=quick_read`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: info.replyToken }),
+      }).catch(() => undefined),
+    );
+    return;
+  }
+
+  if (action === 'reply' && info.replyToken) {
+    const replyUrl = new URL('reply.html', self.registration.scope);
+    const params = new URLSearchParams({
+      t: info.replyToken,
+      c: String(info.conversationId || ''),
+      n: info.senderName || '',
+    });
+    replyUrl.hash = params.toString();
+    event.waitUntil(
+      (async () => {
+        if (self.clients.openWindow) await self.clients.openWindow(replyUrl.href);
+      })(),
+    );
+    return;
+  }
+
   event.waitUntil(
     (async () => {
       const all = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });

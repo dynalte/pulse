@@ -25,6 +25,7 @@ export default defineConfig({
         clientsClaim: true,
         skipWaiting: true,
         navigateFallback: 'index.html',
+        navigateFallbackDenylist: [/\/reply\.html$/],
       },
       manifest: {
         name: 'Pulse — Messagerie',
@@ -34,7 +35,9 @@ export default defineConfig({
         start_url: './',
         scope: './',
         display: 'standalone',
-        orientation: 'portrait-primary',
+        // 'any' : l'app doit pouvoir pivoter en paysage (tablettes notamment).
+        // Le layout est déjà responsive (3 colonnes ≥ 900px, plein écran en dessous).
+        orientation: 'any',
         background_color: '#0a0f1c',
         theme_color: '#0a0f1c',
         categories: ['social', 'communication'],

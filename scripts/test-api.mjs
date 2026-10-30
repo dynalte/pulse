@@ -116,7 +116,7 @@ check('recherche utilisateur', r.data.users.some((u) => u.id === adminId && u.us
 r = await call('user_search', { q: 'zzzz' }, bob);
 check('recherche vide', r.data.users.length === 0);
 r = await call('profile_get', { userId: adminId }, bob);
-check('fiche utilisateur', r.data.user.name === 'Alex Martin' && r.data.user.isContact === false);
+check('fiche utilisateur', r.data.user.name === 'Alex Martin' && r.data.user.isContact === true);
 
 // 5. Conversation directe + message
 r = await call('conversation_create_direct', { userId: bobId }, admin);

@@ -122,6 +122,10 @@ export function previewText(type: string, body: string, deleted = false): string
       return '🎤 Message vocal';
     case 'file':
       return `📎 ${body || 'Fichier'}`;
+    case 'poll':
+      return `📊 ${body || 'Sondage'}`;
+    case 'location':
+      return '📍 Position';
     case 'system':
       return body;
     default:
