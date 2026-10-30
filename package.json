@@ -1,6 +1,6 @@
 {
   "name": "messagerie-ionic",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "Messagerie moderne type WhatsApp — Ionic React PWA + API PHP SQLite",
   "type": "module",
