@@ -175,13 +175,17 @@ export default function SettingsPage() {
         setSubscriptionActive(false);
         toast({ title: 'Notifications désactivées sur cet appareil', tone: 'success' });
       } else {
-        const res = await enablePush();
-        if (!res.ok) {
-          toast({ title: 'Activation impossible', body: res.reason, tone: 'error' });
-        } else {
-          if (!me.notif.enabled) await updateNotif({ enabled: true });
-          setSubscriptionActive(true);
-          toast({ title: 'Notifications activées sur cet appareil', tone: 'success' });
+        try {
+          const res = await enablePush();
+          if (!res.ok) {
+            toast({ title: 'Activation impossible', body: res.reason, tone: 'error' });
+          } else {
+            if (!me.notif.enabled) await updateNotif({ enabled: true });
+            setSubscriptionActive(true);
+            toast({ title: 'Notifications activées sur cet appareil', tone: 'success' });
+          }
+        } catch (err) {
+          toast({ title: 'Activation impossible', body: (err as Error).message, tone: 'error' });
         }
       }
       setPushPermission(typeof Notification !== 'undefined' ? Notification.permission : 'unsupported');

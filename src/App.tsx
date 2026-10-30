@@ -8,6 +8,7 @@ import {
 } from 'ionicons/icons';
 import { AppProvider, useApp } from './context/AppContext';
 import { LoadingScreen, Logo, Toasts, Avatar, Badge } from './components/ui';
+import NotificationPrompt from './components/NotificationPrompt';
 import AuthPage from './pages/AuthPage';
 import ChatsPage from './pages/ChatsPage';
 import ChatPage from './pages/ChatPage';
@@ -195,6 +196,7 @@ const Root: React.FC = () => {
 const App: React.FC = () => (
   <AppProvider>
     <Root />
+    <NotificationPrompt />
     <Toasts />
   </AppProvider>
 );

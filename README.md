@@ -50,6 +50,8 @@ recherche, réactions, accusés de lecture, notifications Web Push et panneau d�
 
 ### Notifications & PWA
 - **Web Push** (VAPID + AES-128-GCM, implémentation PHP native, testée par `scripts/test-push.php`).
+- **À la première connexion**, proposition d’activer les notifications (une seule fois par compte
+  et par appareil, puis retrouvable dans Réglages → Notifications).
 - Préférences : push on/off, messages privés, groupes, aperçu, son, badge.
 - Son local, badge sur l’icône PWA, notification cliquable qui ouvre la bonne conversation.
 - **Réponse rapide depuis la notification** (Android/Chrome) : action « Répondre » vers une page

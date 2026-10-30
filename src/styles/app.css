@@ -1195,6 +1195,13 @@ html[data-theme="light"] .bubble.theirs .file-card { background: var(--surface-2
 .install-banner > div { flex: 1; display: flex; flex-direction: column; }
 .install-banner strong { font-size: 12.5px; }
 .install-banner span { font-size: 11px; color: var(--muted); }
+.notif-prompt { display: flex; flex-direction: column; gap: 11px; }
+.notif-prompt-icon { width: 46px; height: 46px; border-radius: 14px; display: flex; align-items: center; justify-content: center; background: var(--accent-soft); color: var(--accent); font-size: 24px; }
+.notif-prompt p { font-size: 13.5px; line-height: 1.55; color: var(--text-2); }
+.notif-prompt p strong { color: var(--text); }
+.notif-prompt ul { display: flex; flex-direction: column; gap: 6px; padding-left: 20px; font-size: 12.5px; color: var(--muted); }
+.notif-prompt li::marker { color: var(--accent); }
+.notif-prompt .notif-prompt-foot { font-size: 11.5px; color: var(--faint); }
 .settings-link { display: flex; align-items: center; gap: 10px; width: 100%; padding: 12px 4px 2px; text-align: left; color: var(--text-2); }
 .settings-link > ion-icon:first-child { color: var(--accent); font-size: 19px; }
 .settings-link > ion-icon:last-child { margin-left: auto; color: var(--faint); font-size: 16px; }

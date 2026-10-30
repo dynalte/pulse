@@ -19,8 +19,19 @@ function urlBase64ToUint8Array(base64String: string): BufferSource {
 
 async function getRegistration(): Promise<ServiceWorkerRegistration> {
   // VitePWA enregistre le SW ; en dev il n'y a pas de SW actif.
-  const reg = await navigator.serviceWorker.ready;
-  return reg;
+  // On borne l'attente : `ready` ne se résout jamais sans enregistrement.
+  if (!('serviceWorker' in navigator)) throw new Error('Service worker indisponible sur ce navigateur.');
+  let timer = 0;
+  try {
+    return await Promise.race([
+      navigator.serviceWorker.ready,
+      new Promise<never>((_, reject) => {
+        timer = window.setTimeout(() => reject(new Error('Service worker indisponible. Rechargez l’application puis réessayez.')), 5000);
+      }),
+    ]);
+  } finally {
+    if (timer) window.clearTimeout(timer);
+  }
 }
 
 /** Endpoint de l'abonnement push de CE navigateur ('' si aucun). */

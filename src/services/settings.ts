@@ -11,6 +11,7 @@ export const Keys = {
   sound: 'pulse_sound',
   lastSeenSync: 'pulse_last_seen_sync',
   inviteDraft: 'pulse_invite_draft',
+  notifPrompt: 'pulse_notif_prompt',
 } as const;
 
 function getString(key: string, fallback = ''): string {
@@ -95,6 +96,22 @@ export function clearSession() {
   setSetting(Keys.token, null);
   setSetting(Keys.user, null);
   setSetting(Keys.lastSeenSync, null);
+}
+
+/**
+ * Proposition d'activation des notifications à la première connexion :
+ * mémorisée par compte sur cet appareil (elle ne revient pas à chaque login).
+ */
+function notifPromptKey(userId: number): string {
+  return `${Keys.notifPrompt}_${userId}`;
+}
+
+export function notifPromptSeen(userId: number): boolean {
+  return getString(notifPromptKey(userId), '') !== '';
+}
+
+export function markNotifPromptSeen(userId: number, choice: 'enabled' | 'later') {
+  setSetting(notifPromptKey(userId), choice);
 }
 
 export function draftKey(conversationId: number): string {
