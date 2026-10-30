@@ -3,8 +3,7 @@ import { useHistory, useLocation, Route, Switch } from 'react-router-dom';
 import { IonIcon } from '@ionic/react';
 import {
   chatbubblesOutline, peopleOutline, settingsOutline, addOutline, personAddOutline,
-  arrowForwardOutline, shieldCheckmarkOutline, notificationsOutline, imagesOutline, micOutline,
-  timeOutline, sparklesOutline,
+  arrowForwardOutline, timeOutline, sparklesOutline,
 } from 'ionicons/icons';
 import { AppProvider, useApp } from './context/AppContext';
 import { LoadingScreen, Logo, Toasts, Avatar, Badge } from './components/ui';
@@ -106,13 +105,6 @@ const WelcomePane: React.FC = () => {
             <IonIcon icon={peopleOutline} /> Créer un groupe
           </button>
         </div>
-      </div>
-
-      <div className="welcome-features">
-        <div><span><IonIcon icon={shieldCheckmarkOutline} /></span><strong>Contrôlé</strong><em>Chaque compte est invité. Bloquez, masquez, gérez.</em></div>
-        <div><span><IonIcon icon={notificationsOutline} /></span><strong>Notifications</strong><em>Web Push paramétrable, app fermée incluse.</em></div>
-        <div><span><IonIcon icon={imagesOutline} /></span><strong>Médias</strong><em>Photos compressées, documents et vocaux.</em></div>
-        <div><span><IonIcon icon={micOutline} /></span><strong>Vocaux</strong><em>Enregistrement waveform et lecture rapide.</em></div>
       </div>
 
       {recent.length > 0 && (

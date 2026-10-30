@@ -615,12 +615,6 @@ select { appearance: none; background-image: linear-gradient(45deg, transparent 
 .welcome-hero h1 em { font-style: normal; background: linear-gradient(120deg, var(--accent), var(--accent-2)); -webkit-background-clip: text; background-clip: text; color: transparent; }
 .welcome-hero p { max-width: 560px; color: var(--muted); font-size: 15px; line-height: 1.6; }
 .welcome-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 6px; }
-.welcome-features { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; max-width: 900px; }
-.welcome-features > div { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; padding: 15px; display: flex; flex-direction: column; gap: 4px; }
-.welcome-features > div > span { width: 34px; height: 34px; border-radius: 10px; background: var(--accent-soft); color: var(--accent); display: flex; align-items: center; justify-content: center; margin-bottom: 5px; }
-.welcome-features ion-icon { font-size: 18px; }
-.welcome-features strong { font-size: 13px; }
-.welcome-features em { font-style: normal; font-size: 11.5px; color: var(--muted); line-height: 1.4; }
 .welcome-recent { max-width: 900px; width: 100%; }
 .welcome-recent .section-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
 .welcome-recent h3 { font-size: 14px; display: flex; align-items: center; gap: 6px; color: var(--text-2); }
@@ -1566,7 +1560,6 @@ html[data-theme="light"] .bubble.theirs .file-card { background: var(--surface-2
 
 @media (max-width: 1240px) {
   .app-shell { grid-template-columns: 72px 340px minmax(0, 1fr); }
-  .welcome-features { grid-template-columns: repeat(2, 1fr); }
   .group-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .stats-grid { grid-template-columns: repeat(3, 1fr); }
 }
