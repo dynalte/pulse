@@ -7,3 +7,4 @@ api/data/*
 !api/data/.gitkeep
 !api/data/.htaccess
 .env
+mcp/.env

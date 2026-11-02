@@ -1,12 +1,12 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { IonIcon } from '@ionic/react';
 import {
-  attachOutline, barChartOutline, closeCircle, documentOutline, happyOutline, imageOutline,
+  attachOutline, barChartOutline, clipboardOutline, closeCircle, documentOutline, happyOutline, imageOutline,
   locationOutline, micOutline, send, stopCircleOutline, trashOutline, createOutline,
 } from 'ionicons/icons';
 import { uploadMedia } from '../services/api';
 import { useApp } from '../context/AppContext';
-import { prepareImage } from '../services/image';
+import { localPreview, prepareImage } from '../services/image';
 import { VoiceRecorder, recordingSupported } from '../services/voice';
 import { draftKey } from '../services/settings';
 import { durationLabel, previewText } from '../services/utils';
@@ -29,6 +29,28 @@ interface SendPayload {
   location?: { lat: number; lng: number; accuracy?: number; liveSeconds?: number };
 }
 
+interface PendingImage {
+  file: File;
+  url: string;
+}
+
+/** Images présentes dans le presse-papiers (capture d'écran, copie de fichier…). */
+function imagesFromClipboard(data: DataTransfer | null): File[] {
+  if (!data) return [];
+  const files: File[] = [];
+  for (const item of Array.from(data.items || [])) {
+    if (item.kind !== 'file' || !item.type.startsWith('image/')) continue;
+    const file = item.getAsFile();
+    if (file) files.push(file);
+  }
+  if (!files.length) {
+    for (const file of Array.from(data.files || [])) {
+      if (file.type.startsWith('image/')) files.push(file);
+    }
+  }
+  return files;
+}
+
 export function Composer({
   conversation, replyTo, editing, disabledReason, onSend, onTyping, onSent, onCancelContext,
 }: {
@@ -43,6 +65,7 @@ export function Composer({
 }) {
   const { toast } = useApp();
   const [text, setText] = useState('');
+  const [pending, setPending] = useState<PendingImage[]>([]);
   const [emojiOpen, setEmojiOpen] = useState(false);
   const [attachOpen, setAttachOpen] = useState(false);
   const [uploading, setUploading] = useState<string | null>(null);
@@ -59,19 +82,31 @@ export function Composer({
   const recTimer = useRef<number | null>(null);
   const typingTimer = useRef<number | null>(null);
   const lastTypingSent = useRef(0);
+  const pasteFilesRef = useRef<(files: File[]) => void>(() => {});
+  const pendingRef = useRef<PendingImage[]>([]);
   const emojiWrap = useClickOutside<HTMLDivElement>(() => setEmojiOpen(false));
   const disabled = !!disabledReason;
+  const keepFocusRef = useRef(false);
+  const composerBusy = disabled || sending || !!uploading;
 
   // Brouillon + édition.
   useEffect(() => {
     const draft = localStorage.getItem(draftKey(conversation.id)) || '';
     setText(draft);
+    setPending((prev) => {
+      prev.forEach((p) => URL.revokeObjectURL(p.url));
+      return [];
+    });
     setEmojiOpen(false);
     setRecording(false);
     return () => {
       if (typingTimer.current) window.clearTimeout(typingTimer.current);
     };
   }, [conversation.id]);
+
+  useEffect(() => {
+    pendingRef.current = pending;
+  }, [pending]);
 
   useEffect(() => {
     if (editing) {
@@ -104,7 +139,25 @@ export function Composer({
   useEffect(() => () => {
     recorderRef.current?.cancel();
     if (recTimer.current) window.clearInterval(recTimer.current);
+    pendingRef.current.forEach((p) => URL.revokeObjectURL(p.url));
   }, []);
+
+  // Sur ordinateur (souris), la zone de saisie est désactivée pendant l'envoi,
+  // ce qui lui fait perdre le focus : on le rend ensuite pour pouvoir enchaîner.
+  useEffect(() => {
+    if (composerBusy || !keepFocusRef.current) return;
+    keepFocusRef.current = false;
+    const el = textareaRef.current;
+    if (!el) return;
+    el.focus({ preventScroll: true });
+    el.setSelectionRange(el.value.length, el.value.length);
+  }, [composerBusy]);
+
+  const refocusComposer = () => {
+    if (typeof window === 'undefined' || !window.matchMedia) return;
+    // Pas de refocus sur mobile/tactile pour ne pas rouvrir le clavier.
+    if (window.matchMedia('(hover: hover) and (pointer: fine)').matches) keepFocusRef.current = true;
+  };
 
   const notifyTyping = useCallback(() => {
     const now = Date.now();
@@ -117,8 +170,13 @@ export function Composer({
   }, [onTyping]);
 
   const doSendText = async () => {
+    if (pending.length) {
+      await sendPending();
+      return;
+    }
     const body = text.trim();
     if (!body || sending || disabled) return;
+    refocusComposer();
     setSending(true);
     try {
       const ok = await onSend({ type: 'text', body });
@@ -156,6 +214,125 @@ export function Composer({
       toast({ title: 'Envoi impossible', body: (e as Error).message, tone: 'error' });
     } finally {
       setUploading(null);
+    }
+  };
+
+  const addPendingImages = (files: File[]) => {
+    if (!files.length || disabled) return;
+    if (editing) {
+      toast({
+        title: 'Modification en cours',
+        body: 'Terminez ou annulez la modification avant d’ajouter une capture.',
+        tone: 'error',
+      });
+      return;
+    }
+    setEmojiOpen(false);
+    setPending((prev) => [
+      ...prev,
+      ...files.map((file) => ({ file, url: localPreview(file) })),
+    ]);
+  };
+
+  const removePending = (target: PendingImage) => {
+    setPending((prev) => {
+      const next = prev.filter((p) => p !== target);
+      if (next.length !== prev.length) URL.revokeObjectURL(target.url);
+      return next;
+    });
+  };
+
+  const sendPending = async () => {
+    if (disabled || sending || uploading || !pending.length) return;
+    refocusComposer();
+    const images = pending;
+    const caption = text.trim();
+    setUploading(images.length > 1 ? `Envoi de ${images.length} photos…` : 'Envoi de la photo…');
+    let sent = 0;
+    try {
+      for (const image of images) {
+        const img = await prepareImage(image.file);
+        const res = await uploadMedia(img.blob, 'image', {
+          filename: img.filename,
+          width: img.width,
+          height: img.height,
+        });
+        const ok = await onSend({
+          type: 'image',
+          mediaId: res.media.id,
+          body: sent === 0 && caption ? caption : undefined,
+        });
+        if (!ok) break;
+        sent += 1;
+      }
+    } catch (e) {
+      toast({ title: 'Envoi impossible', body: (e as Error).message, tone: 'error' });
+    } finally {
+      if (sent > 0) {
+        const done = images.slice(0, sent);
+        done.forEach((p) => URL.revokeObjectURL(p.url));
+        setPending((prev) => prev.filter((p) => !done.includes(p)));
+        setText('');
+        onSent();
+      }
+      setUploading(null);
+    }
+  };
+
+  // Une capture collée (Ctrl+V / Maj+Ins) devient une pièce jointe en aperçu :
+  // l'utilisateur garde la main pour écrire une légende puis envoyer.
+  useEffect(() => {
+    pasteFilesRef.current = (files) => addPendingImages(files);
+  });
+
+  useEffect(() => {
+    if (disabled) return;
+    const onPaste = (event: ClipboardEvent) => {
+      // Ne pas intercepter un collage destiné à un champ d'une modale ou d'un autre formulaire.
+      if (document.querySelector('.modal-backdrop')) return;
+      const target = event.target as HTMLElement | null;
+      const field = target?.closest?.('input, textarea, [contenteditable="true"]');
+      if (field && !field.closest('.composer-wrap')) return;
+      const files = imagesFromClipboard(event.clipboardData);
+      if (!files.length) return;
+      event.preventDefault();
+      pasteFilesRef.current(files);
+    };
+    document.addEventListener('paste', onPaste);
+    return () => document.removeEventListener('paste', onPaste);
+  }, [disabled]);
+
+  const pasteFromClipboard = async () => {
+    const clipboard = typeof navigator !== 'undefined' ? navigator.clipboard : undefined;
+    if (!clipboard || typeof clipboard.read !== 'function') {
+      toast({
+        title: 'Collage indisponible',
+        body: 'Utilisez Ctrl+V (ou Maj+Ins) pour coller votre capture.',
+        tone: 'error',
+      });
+      return;
+    }
+    try {
+      const items = await clipboard.read();
+      const files: File[] = [];
+      for (const item of items) {
+        const type = item.types.find((t) => t.startsWith('image/'));
+        if (!type) continue;
+        const blob = await item.getType(type);
+        const ext = type === 'image/jpeg' ? 'jpg' : type.split('/')[1] || 'png';
+        files.push(new File([blob], `capture.${ext}`, { type }));
+      }
+      if (!files.length) {
+        toast({ title: 'Aucune capture', body: 'Le presse-papiers ne contient pas d’image.', tone: 'error' });
+        return;
+      }
+      addPendingImages(files);
+    } catch {
+      toast({
+        title: 'Collage impossible',
+        body: 'Autorisez l’accès au presse-papiers, ou utilisez Ctrl+V (Maj+Ins).',
+        tone: 'error',
+      });
     }
   };
 
@@ -323,6 +500,18 @@ export function Composer({
           <IconButton icon={closeCircle} label="Annuler" onClick={onCancelContext} />
         </div>
       )}
+      {pending.length > 0 && (
+        <div className="composer-attachments">
+          {pending.map((item) => (
+            <div className="composer-attachment" key={item.url}>
+              <img src={item.url} alt="Capture collée" />
+              <button type="button" onClick={() => removePending(item)} disabled={!!uploading} aria-label="Retirer la capture">
+                <IonIcon icon={closeCircle} />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
       {uploading && (
         <div className="upload-progress">
           <Spinner size={16} /> {uploading}
@@ -339,13 +528,19 @@ export function Composer({
           value={text}
           onChange={(e) => { setText(e.target.value); notifyTyping(); }}
           onKeyDown={onKeyDown}
-          placeholder={editing ? 'Modifier votre message…' : 'Écrire un message…'}
+          placeholder={
+            editing
+              ? 'Modifier votre message…'
+              : pending.length
+                ? 'Ajoutez une légende…'
+                : 'Écrire un message…'
+          }
           rows={1}
           disabled={sending || !!uploading}
         />
-        {text.trim() ? (
+        {text.trim() || pending.length ? (
           <button type="button" className="send-btn" onClick={() => void doSendText()} disabled={sending || !!uploading} aria-label="Envoyer">
-            {sending ? <Spinner size={20} /> : <IonIcon icon={send} />}
+            {sending || uploading ? <Spinner size={20} /> : <IonIcon icon={send} />}
           </button>
         ) : (
           <button type="button" className="mic-btn" onClick={() => void startRecording()} disabled={sending || !!uploading} aria-label="Enregistrer un message vocal">
@@ -374,6 +569,12 @@ export function Composer({
         title="Joindre"
         actions={[
           { label: 'Photo', icon: imageOutline, onClick: () => imageInput.current?.click() },
+          {
+            label: 'Coller une capture',
+            icon: clipboardOutline,
+            onClick: () => void pasteFromClipboard(),
+            hidden: typeof navigator === 'undefined' || typeof navigator.clipboard?.read !== 'function',
+          },
           { label: 'Document', icon: documentOutline, onClick: () => fileInput.current?.click() },
           { label: 'Sondage', icon: barChartOutline, onClick: () => setPollOpen(true) },
           { label: 'Position', icon: locationOutline, onClick: () => setLocationOpen(true) },

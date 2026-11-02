@@ -329,4 +329,21 @@ check('déconnexion', r.data.ok);
 r = await call('me', {}, bob, 401);
 check('jeton révoqué', r.status === 401);
 
+// 22. Jetons d'accès API
+r = await call('token_create', { name: 'Test MCP', days: 30 }, admin);
+check('création jeton API', r.data.ok && r.data.token.startsWith('pulse_'));
+const apiToken = r.data.token;
+const apiTokenId = r.data.tokenInfo.id;
+check('jeton API : préfixe', r.data.tokenInfo.prefix === apiToken.slice(0, 14));
+r = await call('me', {}, apiToken);
+check('authentification par jeton API', r.data.user.username === 'alex');
+r = await call('tokens_list', {}, apiToken, 403);
+check('gestion des jetons refusée avec un jeton', r.status === 403);
+r = await call('tokens_list', {}, admin);
+check('liste des jetons', r.data.tokens.some((t) => t.id === apiTokenId));
+r = await call('token_revoke', { id: apiTokenId }, admin);
+check('révocation du jeton', r.data.ok);
+r = await call('me', {}, apiToken, 401);
+check('jeton révoqué refusé', r.status === 401);
+
 console.log(`\n${passed} tests réussis.`);

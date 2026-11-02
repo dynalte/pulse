@@ -46,7 +46,7 @@ ini_set('log_errors', '1');
 
 header('Content-Type: application/json; charset=utf-8');
 header('Access-Control-Allow-Origin: *');
-header('Access-Control-Allow-Headers: Content-Type, X-Session-Token');
+header('Access-Control-Allow-Headers: Content-Type, X-Session-Token, X-Api-Token, Authorization');
 header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
 header('X-Content-Type-Options: nosniff');
 header('Referrer-Policy: no-referrer');
@@ -247,6 +247,18 @@ function migrate(PDO $pdo): void
         ua TEXT NOT NULL DEFAULT ''
     );
     CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
+    CREATE TABLE IF NOT EXISTS api_tokens (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        name TEXT NOT NULL DEFAULT '',
+        prefix TEXT NOT NULL DEFAULT '',
+        token_hash TEXT NOT NULL UNIQUE,
+        created_at INTEGER NOT NULL,
+        last_used_at INTEGER NOT NULL DEFAULT 0,
+        expires_at INTEGER NOT NULL DEFAULT 0,
+        revoked_at INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_api_tokens_user ON api_tokens(user_id, revoked_at);
     CREATE TABLE IF NOT EXISTS invites (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         code TEXT NOT NULL UNIQUE,
@@ -587,33 +599,57 @@ function throttle_clear(string $key): void
 
 function request_token(): string
 {
-    $h = (string)($_SERVER['HTTP_X_SESSION_TOKEN'] ?? '');
-    if ($h === '') $h = (string)($_GET['session'] ?? '');
-    return trim($h);
+    $api = trim((string)($_SERVER['HTTP_X_API_TOKEN'] ?? ''));
+    if ($api !== '') return $api;
+    $session = trim((string)($_SERVER['HTTP_X_SESSION_TOKEN'] ?? ''));
+    if ($session !== '') return $session;
+    $auth = trim((string)($_SERVER['HTTP_AUTHORIZATION'] ?? ''));
+    if ($auth !== '' && stripos($auth, 'Bearer ') === 0) return trim(substr($auth, 7));
+    return trim((string)($_GET['session'] ?? ''));
 }
 
 /**
  * Authentifie la requête et retourne la ligne utilisateur enrichie
- * (notif/privacy décodés, session_token).
+ * (notif/privacy décodés, session_token, auth_type = session|api).
  */
 function auth(): array
 {
     $token = request_token();
     if ($token === '') fail('Authentification requise.', 401);
-    $st = db()->prepare('SELECT u.*, s.token AS session_token FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ? AND s.created_at >= ? LIMIT 1');
-    $st->execute([$token, now() - SESSION_TTL]);
-    $u = $st->fetch();
-    if (!$u) {
-        db()->prepare('DELETE FROM sessions WHERE token = ?')->execute([$token]);
-        fail('Session expirée ou compte désactivé.', 401);
-    }
-    if ((int)$u['active'] !== 1) fail('Session expirée ou compte désactivé.', 401);
     $t = now();
+
+    $st = db()->prepare('SELECT u.*, s.token AS session_token FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ? AND s.created_at >= ? LIMIT 1');
+    $st->execute([$token, $t - SESSION_TTL]);
+    $u = $st->fetch();
+    $authType = 'session';
+
+    if (!$u) {
+        // Jeton d'accès personnel : stocké haché, révocable, avec expiration optionnelle.
+        $hash = hash('sha256', $token);
+        $st = db()->prepare('SELECT u.*, tk.id AS api_token_id, tk.last_used_at AS api_token_last_used
+            FROM api_tokens tk JOIN users u ON u.id = tk.user_id
+            WHERE tk.token_hash = ? AND tk.revoked_at = 0 AND (tk.expires_at = 0 OR tk.expires_at > ?)
+            LIMIT 1');
+        $st->execute([$hash, $t]);
+        $u = $st->fetch();
+        $authType = 'api';
+        if (!$u) fail('Jeton invalide, expiré ou révoqué.', 401);
+        if ($t - (int)$u['api_token_last_used'] > 60) {
+            db()->prepare('UPDATE api_tokens SET last_used_at = ? WHERE id = ?')
+                ->execute([$t, (int)$u['api_token_id']]);
+        }
+        $u['session_token'] = '';
+    }
+
+    if ((int)$u['active'] !== 1) fail('Session expirée ou compte désactivé.', 401);
     if ($t - (int)$u['last_seen'] > 25) {
         db()->prepare('UPDATE users SET last_seen = ? WHERE id = ?')->execute([$t, (int)$u['id']]);
-        db()->prepare('UPDATE sessions SET last_seen = ? WHERE token = ?')->execute([$t, $token]);
+        if ($authType === 'session') {
+            db()->prepare('UPDATE sessions SET last_seen = ? WHERE token = ?')->execute([$t, $token]);
+        }
         $u['last_seen'] = $t;
     }
+    $u['auth_type'] = $authType;
     $u['notif'] = user_notif($u);
     $u['privacy'] = user_privacy($u);
     return $u;
@@ -1928,6 +1964,12 @@ try {
                 profile_update_action($user);
             case 'password_change':
                 password_change_action($user);
+            case 'tokens_list':
+                tokens_list_action($user);
+            case 'token_create':
+                token_create_action($user);
+            case 'token_revoke':
+                token_revoke_action($user);
             case 'user_search':
                 user_search_action($user);
             case 'directory':
@@ -2381,7 +2423,95 @@ function password_change_action(array $user): void
         ->execute([password_hash($next, PASSWORD_DEFAULT), now(), (int)$user['id']]);
     db()->prepare('DELETE FROM sessions WHERE user_id = ? AND token <> ?')
         ->execute([(int)$user['id'], (string)$user['session_token']]);
+    // Un changement de mot de passe révoque aussi les jetons d'accès personnels.
+    db()->prepare('UPDATE api_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at = 0')
+        ->execute([now(), (int)$user['id']]);
     ok();
+}
+
+// ============================== API TOKENS ==============================
+
+function api_token_payload(array $row): array
+{
+    return [
+        'id' => (int)$row['id'],
+        'name' => (string)$row['name'],
+        'prefix' => (string)$row['prefix'],
+        'createdAt' => (int)$row['created_at'],
+        'lastUsedAt' => (int)$row['last_used_at'],
+        'expiresAt' => (int)$row['expires_at'],
+    ];
+}
+
+/** La gestion des jetons est réservée à une session web (pas à un jeton). */
+function require_session_auth(array $user): void
+{
+    if (($user['auth_type'] ?? 'session') !== 'session') {
+        fail('La gestion des jetons nécessite une session web connectée.', 403);
+    }
+}
+
+function tokens_list_action(array $user): void
+{
+    require_session_auth($user);
+    $t = now();
+    $st = db()->prepare('SELECT * FROM api_tokens
+        WHERE user_id = ? AND revoked_at = 0 AND (expires_at = 0 OR expires_at > ?)
+        ORDER BY id DESC LIMIT 100');
+    $st->execute([(int)$user['id'], $t]);
+    $out = [];
+    foreach ($st->fetchAll() as $row) $out[] = api_token_payload($row);
+    ok(['tokens' => $out]);
+}
+
+function token_create_action(array $user): void
+{
+    require_session_auth($user);
+    $uid = (int)$user['id'];
+    $name = str_input('name', 80);
+    if ($name === '') $name = 'Jeton d’accès';
+    $days = int_input('days', 90);
+    if (!in_array($days, [0, 30, 90, 365], true)) {
+        fail('Durée invalide : choisissez 0 (illimité), 30, 90 ou 365 jours.');
+    }
+    $t = now();
+    $st = db()->prepare('SELECT COUNT(*) FROM api_tokens
+        WHERE user_id = ? AND revoked_at = 0 AND (expires_at = 0 OR expires_at > ?)');
+    $st->execute([$uid, $t]);
+    if ((int)$st->fetchColumn() >= 20) {
+        fail('Limite de 20 jetons actifs atteinte. Révoquez-en un avant d’en créer un autre.');
+    }
+
+    $raw = 'pulse_' . bin2hex(random_bytes(32));
+    $hash = hash('sha256', $raw);
+    $expires = $days > 0 ? $t + $days * 86400 : 0;
+    db()->prepare('INSERT INTO api_tokens(user_id, name, prefix, token_hash, created_at, last_used_at, expires_at, revoked_at)
+        VALUES(?,?,?,?,?,0,?,0)')
+        ->execute([$uid, $name, substr($raw, 0, 14), $hash, $t, $expires]);
+    $id = (int)db()->lastInsertId();
+
+    ok([
+        'token' => $raw,
+        'tokenInfo' => api_token_payload([
+            'id' => $id,
+            'name' => $name,
+            'prefix' => substr($raw, 0, 14),
+            'created_at' => $t,
+            'last_used_at' => 0,
+            'expires_at' => $expires,
+        ]),
+    ]);
+}
+
+function token_revoke_action(array $user): void
+{
+    require_session_auth($user);
+    $id = int_input('id');
+    if ($id <= 0) fail('Jeton invalide.');
+    $st = db()->prepare('UPDATE api_tokens SET revoked_at = ? WHERE id = ? AND user_id = ? AND revoked_at = 0');
+    $st->execute([now(), $id, (int)$user['id']]);
+    if ($st->rowCount() < 1) fail('Jeton introuvable ou déjà révoqué.', 404);
+    ok(['id' => $id]);
 }
 
 function user_search_action(array $user): void
@@ -4220,7 +4350,11 @@ function admin_user_update_action(array $user): void
         }
         $sets[] = 'active = ?';
         $args[] = $active;
-        if ($active === 0) db()->prepare('DELETE FROM sessions WHERE user_id = ?')->execute([$targetId]);
+        if ($active === 0) {
+            db()->prepare('DELETE FROM sessions WHERE user_id = ?')->execute([$targetId]);
+            db()->prepare('UPDATE api_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at = 0')
+                ->execute([now(), $targetId]);
+        }
     }
     if ($sets) {
         $args[] = $targetId;

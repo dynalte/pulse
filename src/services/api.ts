@@ -309,6 +309,24 @@ export const inviteApi = {
   revoke: (id: number) => request<{ ok: true }>('invite_revoke', { body: { id } }),
 };
 
+/* ---------------------------------------------------------------- jetons API */
+
+export interface ApiToken {
+  id: number;
+  name: string;
+  prefix: string;
+  createdAt: number;
+  lastUsedAt: number;
+  expiresAt: number;
+}
+
+export const tokenApi = {
+  list: () => request<{ tokens: ApiToken[] }>('tokens_list'),
+  create: (name: string, days: number) =>
+    request<{ token: string; tokenInfo: ApiToken }>('token_create', { body: { name, days } }),
+  revoke: (id: number) => request<{ id: number }>('token_revoke', { body: { id } }),
+};
+
 /* ------------------------------------------------------------------- admin */
 
 export const adminApi = {

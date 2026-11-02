@@ -849,6 +849,12 @@ html[data-theme="light"] .bubble.theirs .file-card { background: var(--surface-2
 .context-text strong ion-icon { font-size: 13px; }
 .context-text span { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .upload-progress { display: flex; align-items: center; gap: 7px; font-size: 12px; color: var(--accent); padding: 4px 8px 8px; }
+.composer-attachments { display: flex; gap: 8px; padding: 0 2px 8px; overflow-x: auto; }
+.composer-attachment { position: relative; width: 64px; height: 64px; flex: 0 0 auto; border-radius: 12px; overflow: hidden; border: 1px solid var(--border); background: var(--surface-2); }
+.composer-attachment img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.composer-attachment button { position: absolute; top: 2px; right: 2px; width: 20px; height: 20px; border-radius: 50%; background: rgba(2, 6, 14, 0.62); color: #fff; display: flex; align-items: center; justify-content: center; }
+.composer-attachment button ion-icon { font-size: 15px; }
+.composer-attachment button:disabled { opacity: 0.4; cursor: default; }
 .composer-disabled { display: flex; align-items: center; justify-content: center; gap: 8px; padding: 18px; background: var(--surface); border-top: 1px solid var(--border); color: var(--muted); font-size: 12.5px; text-align: center; }
 .composer-disabled ion-icon { font-size: 18px; }
 .emoji-anchor { position: relative; }
@@ -1236,6 +1242,28 @@ html[data-theme="light"] .bubble.theirs .file-card { background: var(--surface-2
 .admin-invites { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--border); }
 .admin-invites h4 { font-size: 13px; margin-bottom: 10px; }
 .server-edit { padding: 12px; background: var(--surface-2); border-radius: 12px; margin-bottom: 6px; display: flex; flex-direction: column; gap: 10px; }
+.api-token-box { display: flex; align-items: center; gap: 10px; padding: 10px 12px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 12px; }
+.api-token-box code { flex: 1; min-width: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; line-height: 1.5; color: var(--accent); word-break: break-all; }
+.api-token-copy { flex: 0 0 auto; }
+.api-token-hint { margin-top: 9px; font-size: 11px; line-height: 1.55; color: var(--muted); }
+.api-token-hint code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10.5px; background: var(--surface-2); border: 1px solid var(--border); border-radius: 4px; padding: 1px 4px; }
+.settings-intro { font-size: 11.5px; line-height: 1.55; color: var(--muted); margin: -4px 0 12px; }
+.new-token-box { display: flex; flex-direction: column; gap: 8px; padding: 12px; background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent); border-radius: 12px; margin-bottom: 12px; }
+.new-token-head { display: flex; flex-direction: column; gap: 2px; }
+.new-token-head strong { font-size: 12.5px; color: var(--accent); }
+.new-token-head span { font-size: 11px; color: var(--muted); }
+.new-token-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.api-token-list { display: flex; flex-direction: column; gap: 2px; margin: 4px 0 12px; }
+.api-token-row { display: flex; align-items: center; gap: 10px; padding: 8px; border-radius: 11px; }
+.api-token-row:hover { background: var(--surface-2); }
+.api-token-icon { width: 30px; height: 30px; border-radius: 9px; background: var(--surface-2); border: 1px solid var(--border); display: flex; align-items: center; justify-content: center; color: var(--accent); flex: 0 0 auto; }
+.api-token-icon ion-icon { font-size: 16px; }
+.api-token-meta { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.api-token-meta strong { font-size: 12.5px; }
+.api-token-meta code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10.5px; color: var(--muted); }
+.api-token-meta span { font-size: 10.5px; color: var(--muted); }
+.api-token-empty { font-size: 11.5px; color: var(--muted); padding: 4px 0 10px; }
+.token-form { padding: 12px; background: var(--surface-2); border-radius: 12px; display: flex; flex-direction: column; gap: 10px; margin-top: 8px; }
 .logout-block { width: 100%; display: flex; align-items: center; justify-content: center; gap: 8px; height: 48px; border-radius: 14px; border: 1px solid color-mix(in srgb, var(--danger) 28%, transparent); background: var(--danger-soft); color: var(--danger); font-weight: 650; margin-top: 4px; }
 .logout-block:hover { background: color-mix(in srgb, var(--danger) 18%, transparent); }
 .settings-foot { text-align: center; color: var(--faint); font-size: 10.5px; padding: 18px 0 8px; }

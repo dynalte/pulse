@@ -6,10 +6,10 @@ import {
   personOutline, shieldCheckmarkOutline, colorPaletteOutline, lockClosedOutline, serverOutline,
   informationCircleOutline, peopleOutline, mailOutline, powerOutline, refreshOutline,
   addOutline, statsChartOutline, chatbubblesOutline, imageOutline, pencilOutline,
-  phonePortraitOutline, paperPlaneOutline, trashOutline,
+  phonePortraitOutline, paperPlaneOutline, trashOutline, keyOutline, copyOutline,
 } from 'ionicons/icons';
-import { accountApi, adminApi, pushApi, uploadMedia } from '../services/api';
-import type { PushDevice } from '../services/api';
+import { accountApi, adminApi, pushApi, tokenApi, uploadMedia } from '../services/api';
+import type { ApiToken, PushDevice } from '../services/api';
 import { useApp } from '../context/AppContext';
 import { useInstallPrompt } from '../services/hooks';
 import { prepareImage } from '../services/image';
@@ -45,6 +45,15 @@ export default function SettingsPage() {
   const [pushDevices, setPushDevices] = useState<PushDevice[]>([]);
   const [deviceBusy, setDeviceBusy] = useState<number | null>(null);
   const [showPassword, setShowPassword] = useState(false);
+  const [apiTokens, setApiTokens] = useState<ApiToken[]>([]);
+  const [tokenForm, setTokenForm] = useState(false);
+  const [tokenName, setTokenName] = useState('');
+  const [tokenDays, setTokenDays] = useState(90);
+  const [tokenBusy, setTokenBusy] = useState(false);
+  const [newToken, setNewToken] = useState('');
+  const [tokenCopied, setTokenCopied] = useState(false);
+  const [confirmRevoke, setConfirmRevoke] = useState<ApiToken | null>(null);
+  const [revoking, setRevoking] = useState<number | null>(null);
   const [passwords, setPasswords] = useState({ current: '', next: '', confirm: '' });
   const [passwordBusy, setPasswordBusy] = useState(false);
   const [serverUrl, setServerUrl] = useState(settings.apiURL);
@@ -71,6 +80,15 @@ export default function SettingsPage() {
     adminApi.stats().then((res) => setStats(res.stats)).catch(() => undefined);
     adminApi.users().then((res) => setAdminUsers(res.users)).catch(() => undefined);
   }, [me?.role]);
+
+  useEffect(() => {
+    if (!me) return;
+    let alive = true;
+    tokenApi.list()
+      .then((res) => { if (alive) setApiTokens(res.tokens); })
+      .catch(() => undefined);
+    return () => { alive = false; };
+  }, [me?.id]);
 
   // Un compte peut être activé sur plusieurs appareils : on vérifie
   // l'abonnement réel de CE navigateur, pas seulement la préférence serveur.
@@ -260,6 +278,75 @@ export default function SettingsPage() {
     setApiURL(clean);
     setServerEditing(false);
     toast({ title: 'Adresse enregistrée', body: 'Rechargez l’application si le serveur change.', tone: 'success' });
+  };
+
+  const copyText = async (text: string, successTitle = 'Ligne copiée') => {
+    let ok = false;
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        ok = true;
+      }
+    } catch {
+      ok = false;
+    }
+    if (!ok) {
+      // Repli pour les contextes non sécurisés (http://, navigateurs anciens).
+      try {
+        const area = document.createElement('textarea');
+        area.value = text;
+        area.setAttribute('readonly', '');
+        area.style.position = 'fixed';
+        area.style.top = '-1000px';
+        area.style.opacity = '0';
+        document.body.appendChild(area);
+        area.select();
+        ok = document.execCommand('copy');
+        document.body.removeChild(area);
+      } catch {
+        ok = false;
+      }
+    }
+    if (ok) {
+      setTokenCopied(true);
+      window.setTimeout(() => setTokenCopied(false), 2000);
+      toast({ title: successTitle, body: 'Collez la ligne dans mcp/.env.', tone: 'success' });
+    } else {
+      toast({ title: 'Copie impossible', body: 'Sélectionnez le texte et copiez-le manuellement.', tone: 'error' });
+    }
+  };
+
+  const createToken = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setTokenBusy(true);
+    try {
+      const res = await tokenApi.create(tokenName.trim() || 'Jeton MCP', tokenDays);
+      setApiTokens((prev) => [res.tokenInfo, ...prev]);
+      setNewToken(res.token);
+      setTokenName('');
+      setTokenForm(false);
+      toast({ title: 'Jeton créé', body: 'Copiez-le maintenant : il ne sera plus affiché.', tone: 'success' });
+    } catch (err) {
+      toast({ title: 'Création impossible', body: (err as Error).message, tone: 'error' });
+    } finally {
+      setTokenBusy(false);
+    }
+  };
+
+  const revokeToken = async () => {
+    if (!confirmRevoke) return;
+    setRevoking(confirmRevoke.id);
+    try {
+      await tokenApi.revoke(confirmRevoke.id);
+      setApiTokens((prev) => prev.filter((t) => t.id !== confirmRevoke.id));
+      if (newToken && newToken.startsWith(confirmRevoke.prefix)) setNewToken('');
+      toast({ title: 'Jeton révoqué', body: 'Il ne peut plus être utilisé.', tone: 'success' });
+    } catch (err) {
+      toast({ title: 'Révocation impossible', body: (err as Error).message, tone: 'error' });
+    } finally {
+      setRevoking(null);
+      setConfirmRevoke(null);
+    }
   };
 
   const forceUpdate = async () => {
@@ -540,6 +627,107 @@ export default function SettingsPage() {
         )}
       </section>
 
+      <section className="settings-card">
+        <h3><IonIcon icon={keyOutline} /> Jetons d’accès (MCP / IA)</h3>
+        <p className="settings-intro">
+          Générez un jeton pour connecter le serveur MCP Pulse. Un jeton donne accès à votre compte
+          et peut être révoqué à tout moment.
+        </p>
+
+        {newToken && (
+          <div className="new-token-box">
+            <div className="new-token-head">
+              <strong>Jeton créé — copiez-le maintenant</strong>
+              <span>Pour des raisons de sécurité, il ne sera plus affiché ensuite.</span>
+            </div>
+            <div className="api-token-box">
+              <code>{newToken}</code>
+              <button
+                type="button"
+                className="icon-btn api-token-copy"
+                onClick={() => void copyText(`PULSE_API_TOKEN=${newToken}`, 'Jeton copié')}
+                title="Copier la ligne PULSE_API_TOKEN=…"
+                aria-label="Copier le jeton pour mcp/.env"
+              >
+                {tokenCopied ? <IonIcon icon={checkmarkCircle} /> : <IonIcon icon={copyOutline} />}
+              </button>
+            </div>
+            <div className="new-token-actions">
+              <button type="button" className="btn ghost small" onClick={() => void copyText(`PULSE_API_TOKEN=${newToken}`, 'Jeton copié')}>
+                <IonIcon icon={copyOutline} /> Copier pour mcp/.env
+              </button>
+              <button type="button" className="btn ghost small" onClick={() => setNewToken('')}>J’ai copié</button>
+            </div>
+          </div>
+        )}
+
+        {apiTokens.length > 0 ? (
+          <div className="api-token-list">
+            {apiTokens.map((t) => (
+              <div key={t.id} className="api-token-row">
+                <span className="api-token-icon"><IonIcon icon={keyOutline} /></span>
+                <div className="api-token-meta">
+                  <strong>{t.name}</strong>
+                  <code>{t.prefix}…</code>
+                  <span>
+                    Créé le {new Date(t.createdAt * 1000).toLocaleDateString('fr-FR')}
+                    {' · '}
+                    {t.lastUsedAt ? `utilisé ${formatListTime(t.lastUsedAt)}` : 'jamais utilisé'}
+                    {' · '}
+                    {t.expiresAt ? `expire le ${new Date(t.expiresAt * 1000).toLocaleDateString('fr-FR')}` : 'sans expiration'}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  className="icon-btn danger"
+                  onClick={() => setConfirmRevoke(t)}
+                  disabled={revoking === t.id}
+                  title="Révoquer ce jeton"
+                  aria-label={`Révoquer ${t.name}`}
+                >
+                  <IonIcon icon={trashOutline} />
+                </button>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="api-token-empty">Aucun jeton actif.</p>
+        )}
+
+        {tokenForm ? (
+          <form className="token-form" onSubmit={createToken}>
+            <div className="settings-grid-2">
+              <Field label="Nom du jeton" hint="Ex. « MCP OpenCode ».">
+                <input value={tokenName} onChange={(e) => setTokenName(e.target.value)} maxLength={80} placeholder="MCP OpenCode" />
+              </Field>
+              <Field label="Durée">
+                <select value={tokenDays} onChange={(e) => setTokenDays(Number(e.target.value))}>
+                  <option value={30}>30 jours</option>
+                  <option value={90}>90 jours</option>
+                  <option value={365}>1 an</option>
+                  <option value={0}>Sans expiration</option>
+                </select>
+              </Field>
+            </div>
+            <div className="card-actions">
+              <button type="submit" className="btn primary small" disabled={tokenBusy}>
+                {tokenBusy ? <Spinner size={16} /> : <IonIcon icon={keyOutline} />} Générer le jeton
+              </button>
+              <button type="button" className="btn ghost small" onClick={() => setTokenForm(false)}>Annuler</button>
+            </div>
+          </form>
+        ) : (
+          <button type="button" className="btn primary small" onClick={() => setTokenForm(true)}>
+            <IonIcon icon={addOutline} /> Générer un jeton
+          </button>
+        )}
+
+        <p className="api-token-hint">
+          Collez la ligne <code>PULSE_API_TOKEN=…</code> dans <code>mcp/.env</code>. Le jeton donne un accès
+          complet au compte : ne le partagez pas. Changer votre mot de passe révoque tous les jetons.
+        </p>
+      </section>
+
       {isAdmin && (
         <section className="settings-card admin-card">
           <h3><IonIcon icon={statsChartOutline} /> Administration</h3>
@@ -648,6 +836,15 @@ export default function SettingsPage() {
       </button>
       <p className="settings-foot">Pulse · messagerie privée · v{__APP_VERSION__}</p>
 
+      <ConfirmDialog
+        open={!!confirmRevoke}
+        onClose={() => setConfirmRevoke(null)}
+        onConfirm={() => void revokeToken()}
+        title="Révoquer ce jeton ?"
+        message={confirmRevoke ? `« ${confirmRevoke.name} » ne pourra plus être utilisé. Cette action est immédiate.` : ''}
+        confirmLabel="Révoquer"
+        danger
+      />
       <ConfirmDialog
         open={!!confirmUser}
         onClose={() => setConfirmUser(null)}

@@ -1,0 +1,26 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "servers": {
+      "pulse": {
+        "type": "local",
+        "command": ["node", "mcp/pulse-mcp.mjs"],
+        "cwd": ".",
+        "environment": {
+          "PULSE_API_URL": "{env:PULSE_API_URL}",
+          "PULSE_API_TOKEN": "{env:PULSE_API_TOKEN}",
+          "PULSE_LOGIN": "{env:PULSE_LOGIN}",
+          "PULSE_PASSWORD": "{env:PULSE_PASSWORD}",
+          "PULSE_SESSION_TOKEN": "{env:PULSE_SESSION_TOKEN}",
+          "PULSE_READ_ONLY": "{env:PULSE_READ_ONLY}",
+          "PULSE_DRY_RUN": "{env:PULSE_DRY_RUN}",
+          "PULSE_TIMEOUT_MS": "{env:PULSE_TIMEOUT_MS}"
+        },
+        "timeout": {
+          "startup": 20000,
+          "catalog": 20000
+        }
+      }
+    }
+  }
+}

@@ -27,7 +27,8 @@ recherche, réactions, accusés de lecture, notifications Web Push et panneau d�
 ### Messagerie
 - Conversations **directes** et **groupes** (jusqu’à 250 membres), rôles propriétaire/admin/membre.
 - Texte, **photos** (compression client + validation serveur), **documents**, **messages vocaux**
-  (MediaRecorder, waveform, lecture 1×/1,5×/2×).
+  (MediaRecorder, waveform, lecture 1×/1,5×/2×). Une **capture d’écran collée** (Ctrl+V / Maj+Ins)
+  s’ajoute en aperçu au-dessus de la zone de saisie : on peut écrire une légende puis envoyer.
 - Réponses citées, **réactions emoji**, **édition** (15 min), **suppression pour moi / pour tous**,
   **transfert** vers une ou plusieurs conversations, **messages favoris**.
 - Accusés **envoyé / distribué / lu** (info détaillée), indicateur de saisie, présence en ligne.
@@ -256,14 +257,15 @@ connexions simultanées, passer à un serveur WebSocket dédié devient pertinen
 ## 5. API
 
 Toutes les actions passent par `?action=…`. Auth : header `X-Session-Token`
-(ou `?session=` pour les cas média). Réponse JSON `{ ok: true, … }` ou `{ ok: false, error }`.
+(ou `X-Api-Token`, ou `Authorization: Bearer …`, pour un jeton d'accès personnel).
+Réponse JSON `{ ok: true, … }` ou `{ ok: false, error }`.
 
 ### Publiques
 `ping`, `bootstrap_status`, `bootstrap`, `login`, `register`, `invite_info`, `push_key`
 
 ### Authentifiées
 - Compte : `me`, `heartbeat`, `profile_get`, `profile_update`, `password_change`, `user_search`,
-  `directory`, `block_user`, `unblock_user`, `logout`
+  `directory`, `block_user`, `unblock_user`, `logout`, `tokens_list`, `token_create`, `token_revoke`
 - Invitations : `invites_list`, `invite_create`, `invite_revoke`
 - Conversations : `conversations_list`, `conversation_get`, `conversation_create_direct`,
   `conversation_create_group`, `conversation_update`, `conversation_add_members`,
@@ -297,6 +299,7 @@ curl -s -X POST 'https://pulse.example.com/api-messagerie.php?action=conversatio
 
 - `users` (profil, rôle, préférences notif/confidentialité, `last_seen`)
 - `sessions` (jetons, expiration 1 an)
+- `api_tokens` (jetons d'accès personnels hachés, nom, préfixe, expiration, révocation)
 - `invites` (code, e-mail nominatif, usages, expiration, rôle)
 - `conversations` (direct/groupe, nom, avatar, TTL, restriction d’écriture, code d’invitation)
 - `conversation_members` (rôle, lecture/distribution, sourdine, épinglé, archivé, historique masqué)
@@ -313,6 +316,9 @@ Les réglages VAPID sont générés au premier abonnement et stockés dans `meta
 
 - Mots de passe : `password_hash` / `password_verify`, rehash automatique.
 - Jetons de session aléatoires 256 bits, expiration, révocation (logout, mot de passe, désactivation).
+- Jetons d'accès personnels 256 bits, stockés **hachés** (SHA-256), nommés, avec expiration
+  optionnelle et révocation individuelle. Le jeton en clair n'est affiché qu'à la création.
+  Leur gestion (`tokens_list`, `token_create`, `token_revoke`) exige une session web.
 - Limitation des tentatives de connexion/inscription (8 essais / 15 min, blocage 10 min).
 - Uploads : validation MIME réelle (`finfo`), extension aléatoire, images ré-encodées si trop grandes,
   extensions dangereuses refusées, taille limitée. Les médias sont servis après contrôle d’accès.
@@ -333,7 +339,7 @@ Les réglages VAPID sont générés au premier abonnement et stockés dans `meta
 Les scripts supposent une base **vierge** pour `test-api.mjs` (ils créent les comptes de test).
 
 ```sh
-# API complète (91 assertions) — serveur PHP lancé sur 8110
+# API complète — serveur PHP lancé sur 8110
 npm run api
 node scripts/test-api.mjs
 
@@ -345,6 +351,9 @@ npx playwright install chromium   # ou CHROME_PATH=/usr/bin/chromium
 node scripts/ui-smoke.mjs          # captures desktop/mobile
 node scripts/ui-flow.mjs           # temps réel, édition, suppression, recherche
 node scripts/ui-flow2.mjs          # invitation compte, groupe, image, vocal, thème clair
+
+# Serveur MCP (fausse API en mémoire + vrai client MCP)
+npm run test:mcp
 ```
 
 Variables : `API_URL`, `BASE`, `CHROME_PATH`. Les captures sont écrites dans `/tmp/pulse-*`.
@@ -363,8 +372,10 @@ api/
   .user.ini              limites d'upload
   data/                  créé au runtime (ignoré par git)
 public/                  logo, icônes PWA, push-sw.js
+mcp/                     serveur MCP (pilotage par IA) + doc
 scripts/
   test-api.mjs           tests API
+  test-mcp.mjs           tests du serveur MCP
   test-push.php          tests crypto push
   ui-smoke.mjs           captures UI
   ui-flow.mjs            parcours temps réel
@@ -380,7 +391,26 @@ src/
 
 ---
 
-## 10. Roadmap suggérée
+## 10. Pilotage par IA (MCP)
+
+Un serveur **MCP** local permet à OpenCode (ou Claude Desktop, Cursor…) de lire et
+d'écrire dans Pulse : lister les conversations, lire/rechercher des messages, envoyer
+du texte ou des sondages, répondre, réagir, créer un groupe, etc.
+
+```sh
+npm run mcp:token              # crée un jeton d'accès et l'écrit dans mcp/.env
+npm run mcp:check              # test ping + authentification
+```
+
+Le serveur MCP est déjà déclaré dans `opencode.json` ; les outils apparaissent sous `pulse_*`.
+Le jeton se génère dans **Réglages → Jetons d’accès (MCP / IA)**, puis se colle dans
+`mcp/.env` sous la forme `PULSE_API_TOKEN=…`.
+Modes de sécurité : `PULSE_READ_ONLY=1` (lecture seule) et `PULSE_DRY_RUN=1`
+(simulation des écritures). Détails et liste des 19 outils : [`mcp/README.md`](mcp/README.md).
+
+---
+
+## 11. Roadmap suggérée
 
 1. **Appels audio/vidéo** (WebRTC + signalisation via `stream`/WebSocket).
 2. **Statuts / stories** 24 h avec audience paramétrable.
