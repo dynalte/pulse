@@ -406,7 +406,7 @@ Le serveur MCP est déjà déclaré dans `opencode.json` ; les outils apparaisse
 Le jeton se génère dans **Réglages → Jetons d’accès (MCP / IA)**, puis se colle dans
 `mcp/.env` sous la forme `PULSE_API_TOKEN=…`.
 Modes de sécurité : `PULSE_READ_ONLY=1` (lecture seule) et `PULSE_DRY_RUN=1`
-(simulation des écritures). Détails et liste des 19 outils : [`mcp/README.md`](mcp/README.md).
+(simulation des écritures). Détails et liste des 22 outils : [`mcp/README.md`](mcp/README.md).
 
 ---
 

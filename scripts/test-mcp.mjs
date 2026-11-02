@@ -39,6 +39,7 @@ const validApiTokens = new Set();
 const apiTokenStore = [];
 let apiTokenSeq = 0;
 let loginCount = 0;
+let convListCount = 0;
 
 const user = {
   id: 1, username: 'assistant', name: 'Assistant', bio: 'Compte IA',
@@ -133,6 +134,7 @@ function handle(action, body, req) {
     case 'me':
       return [200, { ok: true, user }];
     case 'conversations_list':
+      convListCount++;
       return [200, { ok: true, conversations: [conversation], unreadTotal: 2 }];
     case 'conversation_get':
       return [
@@ -287,6 +289,7 @@ const transport = new StdioClientTransport({
   cwd: ROOT,
   env: {
     ...process.env,
+    PULSE_NO_DOTENV: '1',
     PULSE_API_URL: apiUrl,
     PULSE_LOGIN: 'assistant',
     PULSE_PASSWORD: 'secret123',
@@ -304,11 +307,12 @@ function textOf(result) {
 try {
   const { tools } = await client.listTools();
   const names = tools.map((t) => t.name);
-  check('découverte : 19 outils exposés', names.length === 19, `→ ${names.length}`);
+  check('découverte : 22 outils exposés', names.length === 22, `→ ${names.length}`);
   for (const name of [
     'pulse_health', 'pulse_whoami', 'pulse_list_conversations', 'pulse_get_conversation',
     'pulse_read_messages', 'pulse_search', 'pulse_list_contacts', 'pulse_find_people',
-    'pulse_list_media', 'pulse_send_message', 'pulse_edit_message', 'pulse_delete_message',
+    'pulse_list_media', 'pulse_unread_summary', 'pulse_send_message', 'pulse_send_to',
+    'pulse_reply_last', 'pulse_edit_message', 'pulse_delete_message',
     'pulse_react', 'pulse_mark_read', 'pulse_create_direct', 'pulse_create_group',
     'pulse_forward_message', 'pulse_star_message', 'pulse_pin_message',
   ]) {
@@ -326,6 +330,21 @@ try {
 
   r = await client.callTool({ name: 'pulse_list_conversations', arguments: {} });
   check('list_conversations : id et dernier message', textOf(r).includes('#10') && textOf(r).includes('Tu es là ?'));
+
+  const beforeConv = convListCount;
+  r = await client.callTool({ name: 'pulse_unread_summary', arguments: {} });
+  check('unread_summary : non-lus', textOf(r).includes('Alice') && textOf(r).includes('non lu'), textOf(r));
+  check('cache : unread_summary réutilise conversations_list', convListCount === beforeConv, `→ ${convListCount - beforeConv}`);
+
+  r = await client.callTool({ name: 'pulse_send_to', arguments: { target: 'Alice', text: 'Message raccourci' } });
+  check('send_to : contact résolu et message envoyé', textOf(r).includes('Message raccourci') && textOf(r).includes('Alice'), textOf(r));
+
+  r = await client.callTool({ name: 'pulse_reply_last', arguments: { target: '#10', text: 'Réponse rapide' } });
+  check('reply_last : citation du dernier message', textOf(r).includes('Réponse rapide') && textOf(r).includes('réponse à #42'), textOf(r));
+
+  const afterWrite = convListCount;
+  await client.callTool({ name: 'pulse_list_conversations', arguments: {} });
+  check('écriture : cache invalidé', convListCount === afterWrite + 1, `→ ${convListCount - afterWrite}`);
 
   r = await client.callTool({ name: 'pulse_get_conversation', arguments: { conversationId: 10 } });
   check('get_conversation : membres listés', textOf(r).includes('Alice') && textOf(r).includes('Membres'));
@@ -379,6 +398,7 @@ try {
     cwd: ROOT,
     env: {
       ...process.env,
+      PULSE_NO_DOTENV: '1',
       PULSE_API_URL: apiUrl,
       PULSE_LOGIN: 'assistant',
       PULSE_PASSWORD: 'mauvais',
@@ -399,6 +419,7 @@ try {
     cwd: ROOT,
     env: {
       ...process.env,
+      PULSE_NO_DOTENV: '1',
       PULSE_API_URL: apiUrl,
       PULSE_LOGIN: 'assistant',
       PULSE_PASSWORD: 'secret123',
@@ -409,7 +430,7 @@ try {
   });
   await ro.connect(roTransport);
   const roTools = (await ro.listTools()).tools.map((t) => t.name);
-  check('lecture seule : 9 outils', roTools.length === 9, `→ ${roTools.length}`);
+  check('lecture seule : 10 outils', roTools.length === 10, `→ ${roTools.length}`);
   check('lecture seule : send_message absent', !roTools.includes('pulse_send_message'));
   check('lecture seule : read_messages présent', roTools.includes('pulse_read_messages'));
   await ro.close();
@@ -422,6 +443,7 @@ try {
     cwd: ROOT,
     env: {
       ...process.env,
+      PULSE_NO_DOTENV: '1',
       PULSE_API_URL: apiUrl,
       PULSE_LOGIN: 'assistant',
       PULSE_PASSWORD: 'secret123',
@@ -445,6 +467,7 @@ try {
       env: {
         ...process.env,
         PULSE_ENV_FILE: tokenEnv,
+        PULSE_NO_DOTENV: '1',
         PULSE_API_URL: apiUrl,
         PULSE_LOGIN: 'assistant',
         PULSE_PASSWORD: 'secret123',
@@ -475,6 +498,7 @@ try {
     cwd: ROOT,
     env: {
       ...process.env,
+      PULSE_NO_DOTENV: '1',
       PULSE_API_URL: apiUrl,
       PULSE_API_TOKEN: tokenMatch[1],
       PULSE_SESSION_FILE: path.join(tmp, 'token-session.json'),

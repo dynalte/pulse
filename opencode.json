@@ -14,7 +14,8 @@
           "PULSE_SESSION_TOKEN": "{env:PULSE_SESSION_TOKEN}",
           "PULSE_READ_ONLY": "{env:PULSE_READ_ONLY}",
           "PULSE_DRY_RUN": "{env:PULSE_DRY_RUN}",
-          "PULSE_TIMEOUT_MS": "{env:PULSE_TIMEOUT_MS}"
+          "PULSE_TIMEOUT_MS": "{env:PULSE_TIMEOUT_MS}",
+          "PULSE_MCP_CACHE_MS": "{env:PULSE_MCP_CACHE_MS}"
         },
         "timeout": {
           "startup": 20000,

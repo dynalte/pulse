@@ -57,9 +57,14 @@ function loadEnvFile(file) {
 }
 
 const XDG_CONFIG = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
-// Le fichier du projet est prioritaire : on le charge en premier.
-loadEnvFile(path.join(HERE, '.env'));
-loadEnvFile(path.join(XDG_CONFIG, 'pulse-mcp', '.env'));
+const SKIP_ENV_FILE = ['1', 'true', 'yes', 'on'].includes(
+  String(process.env.PULSE_NO_DOTENV || '').trim().toLowerCase(),
+);
+if (!SKIP_ENV_FILE) {
+  // Le fichier du projet est prioritaire : on le charge en premier.
+  loadEnvFile(path.join(HERE, '.env'));
+  loadEnvFile(path.join(XDG_CONFIG, 'pulse-mcp', '.env'));
+}
 
 function truthy(value) {
   return ['1', 'true', 'yes', 'on'].includes(String(value || '').trim().toLowerCase());
@@ -233,6 +238,36 @@ async function ensureSession(force = false) {
   return loginInFlight;
 }
 
+const WRITE_ACTIONS = new Set([
+  'message_send', 'message_edit', 'message_delete', 'message_forward', 'message_react',
+  'message_star', 'message_pin', 'conversation_read', 'conversation_create_direct',
+  'conversation_create_group', 'conversation_update', 'conversation_add_members',
+  'conversation_remove_member', 'conversation_leave', 'conversation_set_role',
+  'conversation_mute', 'conversation_pin', 'conversation_archive', 'conversation_clear',
+  'conversation_delete', 'conversation_join',
+]);
+
+const CACHE_MS = Math.max(0, Number(envValue('PULSE_MCP_CACHE_MS')) || 3000);
+let convCache = { at: 0, data: null, includeArchived: true };
+
+function invalidateConvCache() {
+  convCache = { at: 0, data: null, includeArchived: true };
+}
+
+/** `conversations_list` avec un cache très court, invalidé dès qu'on écrit. */
+async function getConversations(includeArchived = true) {
+  if (
+    convCache.data &&
+    convCache.includeArchived === includeArchived &&
+    Date.now() - convCache.at < CACHE_MS
+  ) {
+    return convCache.data;
+  }
+  const data = await api('conversations_list', { includeArchived });
+  convCache = { at: Date.now(), data, includeArchived };
+  return data;
+}
+
 async function api(action, body = {}) {
   let auth = currentAuth();
   if (!auth) {
@@ -240,7 +275,9 @@ async function api(action, body = {}) {
     auth = { token: fresh, header: 'X-Session-Token', type: 'session' };
   }
   try {
-    return await rawRequest(action, body, auth);
+    const data = await rawRequest(action, body, auth);
+    if (WRITE_ACTIONS.has(action)) invalidateConvCache();
+    return data;
   } catch (e) {
     if (e instanceof PulseError && e.status === 401) {
       if (auth.type === 'api') {
@@ -251,7 +288,9 @@ async function api(action, body = {}) {
         clearCachedToken();
         sessionToken = '';
         const fresh = await ensureSession(true);
-        return rawRequest(action, body, { token: fresh, header: 'X-Session-Token', type: 'session' });
+        const data = await rawRequest(action, body, { token: fresh, header: 'X-Session-Token', type: 'session' });
+        if (WRITE_ACTIONS.has(action)) invalidateConvCache();
+        return data;
       }
       e.message += ' (session expirée ?)';
     }
@@ -383,6 +422,49 @@ function conversationLine(c) {
   }\n    ${last}`;
 }
 
+function conversationScore(c, needle) {
+  const n = String(needle || '').toLowerCase().trim();
+  if (!n) return 0;
+  const title = String(c.title || '').toLowerCase();
+  const peerName = c.peer ? String(c.peer.name || '').toLowerCase() : '';
+  const peerUser = c.peer ? String(c.peer.username || '').toLowerCase() : '';
+  if (title === n || peerName === n || peerUser === n) return 3;
+  if (title.startsWith(n) || peerName.startsWith(n) || peerUser.startsWith(n)) return 2;
+  if (title.includes(n) || peerName.includes(n) || peerUser.includes(n)) return 1;
+  return 0;
+}
+
+/**
+ * Retrouve une conversation par #id, titre de groupe ou nom/identifiant du contact.
+ * Retourne { conversation } ou { candidates } (ambiguïté) ou {} (introuvable).
+ */
+async function findConversation(target) {
+  const raw = String(target || '').trim();
+  const id = raw.match(/^#?(\d+)$/);
+  if (id) {
+    const { conversation } = await api('conversation_get', { id: Number(id[1]) });
+    return { conversation };
+  }
+  const { conversations } = await getConversations(true);
+  const scored = conversations
+    .map((c) => ({ c, score: conversationScore(c, raw) }))
+    .filter((x) => x.score > 0)
+    .sort((a, b) => b.score - a.score || (b.c.updatedAt || 0) - (a.c.updatedAt || 0));
+  if (!scored.length) return {};
+  const bestScore = scored[0].score;
+  const best = scored.filter((x) => x.score === bestScore).map((x) => x.c);
+  if (best.length === 1) return { conversation: best[0] };
+  return { candidates: best };
+}
+
+function candidatesText(candidates) {
+  return (
+    'Plusieurs conversations correspondent :\n' +
+    candidates.map((c) => `#${c.id} ${c.title} (${c.type})`).join('\n') +
+    '\nPrécise avec un #id.'
+  );
+}
+
 /* ---------------------------------------------------------------- results */
 
 function textResult(text) {
@@ -428,7 +510,9 @@ const server = new McpServer(
   {
     instructions:
       'Pulse est une messagerie privée (conversations directes et groupes). ' +
-      'Commence toujours par pulse_list_conversations pour obtenir les identifiants numériques, ' +
+      'Pour envoyer à un contact par son nom, utilise pulse_send_to ; pour répondre au dernier ' +
+      'message, pulse_reply_last ; pour les non-lus, pulse_unread_summary. ' +
+      'Sinon, commence par pulse_list_conversations pour obtenir les identifiants numériques, ' +
       'puis pulse_read_messages avec conversationId. Les identifiants (#12) sont ceux des messages. ' +
       "N'envoie, ne modifie ou ne supprime un message que si l'utilisateur le demande explicitement ; " +
       "en cas de doute, montre d'abord le message prévu et demande confirmation. " +
@@ -491,13 +575,43 @@ server.registerTool(
     annotations: { readOnlyHint: true },
   },
   tool(async ({ includeArchived = true }) => {
-    const { conversations, unreadTotal } = await api('conversations_list', { includeArchived });
+    const { conversations, unreadTotal } = await getConversations(includeArchived);
     if (!conversations?.length) {
       return textResult('Aucune conversation. Le compte ne participe à aucune discussion.');
     }
     const lines = conversations.map(conversationLine).join('\n');
     return textResult(
       `${conversations.length} conversation(s) — ${unreadTotal} message(s) non lu(s) au total.\n\n${lines}`,
+    );
+  }),
+);
+
+server.registerTool(
+  'pulse_unread_summary',
+  {
+    title: 'Résumé des non-lus',
+    description:
+      'Réponse compacte : uniquement les conversations avec des messages non lus, triées par activité récente. ' +
+      'À utiliser en priorité pour « qu’est-ce que j’ai manqué ? ».',
+    inputSchema: {
+      limit: z.number().int().min(1).max(50).optional().default(10).describe('Nombre de conversations (10 par défaut).'),
+    },
+    annotations: { readOnlyHint: true },
+  },
+  tool(async ({ limit = 10 }) => {
+    const { conversations, unreadTotal } = await getConversations(true);
+    const unread = conversations
+      .filter((c) => (c.unread || 0) > 0)
+      .sort(
+        (a, b) =>
+          (b.lastMessage?.createdAt || 0) - (a.lastMessage?.createdAt || 0) ||
+          (b.updatedAt || 0) - (a.updatedAt || 0),
+      )
+      .slice(0, limit);
+    if (!unread.length) return textResult('Aucun message non lu.');
+    return textResult(
+      `${unreadTotal} message(s) non lu(s) dans ${unread.length} conversation(s) :\n\n` +
+        unread.map(conversationLine).join('\n'),
     );
   }),
 );
@@ -794,6 +908,100 @@ registerWriteTool(
     return textResult(
       `Message envoyé dans #${conversationId} :\n${messageLine(message)}\n` +
         `(message #${message.id})`,
+    );
+  }),
+);
+
+registerWriteTool(
+  'pulse_send_to',
+  {
+    title: 'Envoyer à un contact par son nom',
+    description:
+      'Raccourci : envoie un message à un contact ou un groupe à partir de son nom, sans appeler ' +
+      'pulse_list_conversations. `target` accepte un nom, un @identifiant, un titre de groupe ou un #id. ' +
+      "À utiliser sur demande explicite de l'utilisateur.",
+    inputSchema: {
+      target: z.string().min(1).max(120).describe('Nom du contact, @identifiant, titre de groupe ou #id.'),
+      text: z.string().min(1).max(4000).describe('Texte du message.'),
+      replyToId: z.number().int().positive().optional().describe('Message à citer (#id).'),
+    },
+    annotations: { destructiveHint: false, idempotentHint: false },
+  },
+  tool(async ({ target, text, replyToId }) => {
+    const found = await findConversation(target);
+    if (found.candidates) return textResult(candidatesText(found.candidates));
+    let conversation = found.conversation;
+
+    if (!conversation) {
+      const { users } = await api('user_search', { q: target });
+      const contacts = (users || []).filter(
+        (u) => u.contactStatus === 'accepted' || u.isContact,
+      );
+      if (!contacts.length) {
+        const body = users?.length
+          ? `Aucun contact accepté ne correspond à « ${target} ». Résultats :\n${users.map(userLine).join('\n')}`
+          : `Aucun contact ne correspond à « ${target} ».`;
+        return textResult(`${body}\nAjoute d’abord le contact depuis l’application Pulse.`);
+      }
+      if (contacts.length > 1) {
+        return textResult(
+          `Plusieurs contacts correspondent à « ${target} » :\n${contacts.map(userLine).join('\n')}\nPrécise le nom ou l’@identifiant.`,
+        );
+      }
+      if (DRY_RUN) {
+        return dryRun(
+          `Message à ${contacts[0].name} (création du direct + envoi).`,
+          'conversation_create_direct+message_send',
+          { userId: contacts[0].id, body: text },
+        );
+      }
+      const created = await api('conversation_create_direct', { userId: contacts[0].id });
+      conversation = created.conversation;
+    }
+
+    const payload = { conversationId: conversation.id, type: 'text', body: text };
+    if (replyToId) payload.replyTo = replyToId;
+    if (DRY_RUN) return dryRun(`Message à ${conversation.title}.`, 'message_send', payload);
+    const { message } = await api('message_send', payload);
+    return textResult(
+      `Message envoyé à ${conversation.title} (#${conversation.id}) :\n${messageLine(message)}`,
+    );
+  }),
+);
+
+registerWriteTool(
+  'pulse_reply_last',
+  {
+    title: 'Répondre au dernier message',
+    description:
+      'Raccourci : répond au dernier message d’une conversation identifiée par son nom ou son #id, ' +
+      'sans avoir à chercher le message. À utiliser sur demande explicite.',
+    inputSchema: {
+      target: z.string().min(1).max(120).describe('Nom du contact, titre du groupe ou #id.'),
+      text: z.string().min(1).max(4000).describe('Texte de la réponse.'),
+    },
+    annotations: { destructiveHint: false, idempotentHint: false },
+  },
+  tool(async ({ target, text }) => {
+    const found = await findConversation(target);
+    if (found.candidates) return textResult(candidatesText(found.candidates));
+    if (!found.conversation) {
+      throw new PulseError(`Conversation « ${target} » introuvable.`, 404, 'conversations_list');
+    }
+    const conversation = found.conversation;
+    const { messages } = await api('messages_list', { conversationId: conversation.id, limit: 1 });
+    const last = messages?.[messages.length - 1];
+    const payload = { conversationId: conversation.id, type: 'text', body: text };
+    if (last) payload.replyTo = last.id;
+    if (DRY_RUN) {
+      return dryRun(`Réponse dans ${conversation.title}${last ? ` à #${last.id}` : ''}.`, 'message_send', payload);
+    }
+    const { message } = await api('message_send', payload);
+    const quote = last
+      ? `\n↳ réponse à #${last.id} ${last.senderName} : ${String(last.body || `[${last.type}]`).slice(0, 80)}`
+      : '\n(aucun message précédent : envoi simple)';
+    return textResult(
+      `Réponse envoyée dans ${conversation.title} (#${conversation.id}) :\n${messageLine(message)}${quote}`,
     );
   }),
 );

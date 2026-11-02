@@ -8,19 +8,25 @@ côté serveur : il appelle `api-messagerie.php` en HTTPS avec un jeton de sessi
 OpenCode ──stdio──▶ mcp/pulse-mcp.mjs ──HTTPS──▶ api-messagerie.php ──▶ SQLite
 ```
 
-## Outils exposés (19)
+## Outils exposés (22)
 
 | Lecture | Écriture |
 |---|---|
 | `pulse_health` — joignabilité de l'API | `pulse_send_message` — texte ou sondage |
-| `pulse_whoami` — compte courant | `pulse_edit_message` — édition (15 min) |
-| `pulse_list_conversations` | `pulse_delete_message` — pour soi / pour tous |
-| `pulse_get_conversation` — membres, rôles | `pulse_react` — réaction emoji |
-| `pulse_read_messages` — transcript + pagination | `pulse_mark_read` |
-| `pulse_search` — globale ou dans un fil | `pulse_create_direct` |
-| `pulse_list_contacts` — contacts + demandes | `pulse_create_group` |
-| `pulse_find_people` — recherche d'utilisateurs | `pulse_forward_message` |
-| `pulse_list_media` — galerie d'un fil | `pulse_star_message`, `pulse_pin_message` |
+| `pulse_whoami` — compte courant | `pulse_send_to` — envoyer à un contact par son nom |
+| `pulse_list_conversations` | `pulse_reply_last` — répondre au dernier message |
+| `pulse_unread_summary` — non-lus compacts | `pulse_edit_message` — édition (15 min) |
+| `pulse_get_conversation` — membres, rôles | `pulse_delete_message` — pour soi / pour tous |
+| `pulse_read_messages` — transcript + pagination | `pulse_react` — réaction emoji |
+| `pulse_search` — globale ou dans un fil | `pulse_mark_read` |
+| `pulse_list_contacts` — contacts + demandes | `pulse_create_direct` |
+| `pulse_find_people` — recherche d'utilisateurs | `pulse_create_group` |
+| `pulse_list_media` — galerie d'un fil | `pulse_forward_message` |
+| | `pulse_star_message`, `pulse_pin_message` |
+
+Un cache court (3 s) de `conversations_list` est réutilisé par `pulse_unread_summary`,
+`pulse_send_to` et `pulse_reply_last` ; il est invalidé à la première écriture.
+Réglable via `PULSE_MCP_CACHE_MS` (0 pour désactiver).
 
 Volontairement **hors périmètre** : administration (stats, comptes, invitations),
 upload/téléchargement de médias, écoute du flux SSE. Ce sont des ajouts simples si
@@ -152,5 +158,5 @@ node scripts/test-mcp.mjs
 ```
 
 Le test démarre une fausse API Pulse en mémoire, un vrai client MCP, et vérifie les
-51 assertions : découverte des outils, lecture, écriture, cache de session,
+59 assertions : découverte des outils, lecture, écriture, cache de session,
 reconnexion transparente sur 401, génération de jeton, mode lecture seule et dry-run.
