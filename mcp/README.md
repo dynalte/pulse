@@ -17,7 +17,8 @@ OpenCode ──stdio──▶ mcp/pulse-mcp.mjs ──HTTPS──▶ api-message
 | `pulse_list_conversations` | `pulse_reply_last` — répondre au dernier message |
 | `pulse_unread_summary` — non-lus compacts | `pulse_edit_message` — édition (15 min) |
 | `pulse_get_conversation` — membres, rôles | `pulse_delete_message` — pour soi / pour tous |
-| `pulse_read_messages` — transcript + pagination | `pulse_react` — réaction emoji |
+| `pulse_read_messages` — transcript + pagination |
+ `pulse_react` — réaction emoji |
 | `pulse_search` — globale ou dans un fil | `pulse_mark_read` |
 | `pulse_list_contacts` — contacts + demandes | `pulse_create_direct` |
 | `pulse_find_people` — recherche d'utilisateurs | `pulse_create_group` |
@@ -77,6 +78,31 @@ habituelles. Un fichier `.env` local au projet est prioritaire.
 > invite-le dans les conversations qu'il doit suivre. Tu gardes ainsi une trace claire
 > de ce que fait l'IA, et tu peux le retirer sans toucher à ton compte.
 
+### 2 bis. Plusieurs utilisateurs Pulse sur le même OpenCode
+
+Le serveur MCP reste un processus unique, mais OpenCode transmet l'identifiant de la
+session appelante dans `params._meta["ai.opencode/sessionID"]`. Echo dépose donc, pour
+chaque session, un petit fichier `<PULSE_SESSION_DIR>/<sessionID>.json` :
+
+```json
+{ "token": "pulse_…", "apiUrl": "https://pulse.dynaspirit.com/api-messagerie.php" }
+```
+
+À chaque appel d'outil, le serveur utilise le jeton de cette session s'il existe. Le
+compte admin (`PULSE_API_TOKEN`) ne sert que de repli quand aucun fichier n'est présent
+(CLI, usage direct d'OpenCode). Un fichier avec `"token": ""` bloque explicitement le
+repli : la conversation doit se reconnecter dans Echo.
+
+`PULSE_SESSION_DIR` vaut par défaut `/tmp/opencode/pulse-sessions`, le même chemin que
+celui utilisé par Echo. Les jetons sont créés par Echo pour 90 jours, nommés « Echo MCP »,
+et révoqués à la déconnexion.
+
+### 2 ter. Instructions visibles dans Echo
+
+Les consignes du serveur sont aussi publiées comme ressource MCP
+`pulse://instructions` (texte complet dans sa description). Echo les affiche dans
+**Réglages → Instructions MCP**, sans dupliquer le texte.
+
 ### 3. OpenCode
 
 Le fichier `opencode.json` à la racine du projet déclare déjà le serveur :
@@ -124,6 +150,7 @@ Affiche l'URL, le compte, le mode, teste `ping` puis l'authentification (`me`).
 | `PULSE_API_TOKEN=…` | Jeton d'accès personnel (recommandé, généré dans Pulse ou via `npm run mcp:token`). |
 | `PULSE_SESSION_TOKEN=…` | Ancien mode : jeton de session du navigateur. |
 | `PULSE_SESSION_FILE=…` | Cache de session pour le mode login/mot de passe (défaut `~/.cache/pulse-mcp/session.json`, chmod 600). |
+| `PULSE_SESSION_DIR=…` | Jetons par session OpenCode déposés par Echo (défaut `/tmp/opencode/pulse-sessions`). Un fichier présent mais vide interdit le repli sur le compte admin. |
 
 Autres garde-fous :
 
@@ -158,5 +185,6 @@ node scripts/test-mcp.mjs
 ```
 
 Le test démarre une fausse API Pulse en mémoire, un vrai client MCP, et vérifie les
-59 assertions : découverte des outils, lecture, écriture, cache de session,
-reconnexion transparente sur 401, génération de jeton, mode lecture seule et dry-run.
+63 assertions : découverte des outils, lecture, écriture, cache de session,
+reconnexion transparente sur 401, génération de jeton, identité par session
+OpenCode, ressource d'instructions, mode lecture seule et dry-run.

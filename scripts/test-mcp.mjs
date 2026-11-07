@@ -40,6 +40,7 @@ const apiTokenStore = [];
 let apiTokenSeq = 0;
 let loginCount = 0;
 let convListCount = 0;
+let delegatedToken = '';
 
 const user = {
   id: 1, username: 'assistant', name: 'Assistant', bio: 'Compte IA',
@@ -51,6 +52,9 @@ const peer = {
   id: 2, username: 'alice', name: 'Alice', bio: '', phone: '', email: 'alice@example.com',
   avatarId: null, role: 'member', createdAt: now - 90000, lastSeen: now - 30,
   online: true, isContact: true, contactStatus: 'accepted',
+};
+const delegatedUser = {
+  ...user, id: 3, username: 'bob', name: 'Bob', bio: 'Compte délégué', email: 'bob@example.com',
 };
 const conversation = {
   id: 10, type: 'direct', title: 'Alice', description: '', avatarId: null,
@@ -131,8 +135,10 @@ function handle(action, body, req) {
       validTokens.add(token);
       return [200, { ok: true, token, user }];
     }
-    case 'me':
-      return [200, { ok: true, user }];
+    case 'me': {
+      const token = String(req.headers['x-api-token'] || '');
+      return [200, { ok: true, user: token && token === delegatedToken ? delegatedUser : user }];
+    }
     case 'conversations_list':
       convListCount++;
       return [200, { ok: true, conversations: [conversation], unreadTotal: 2 }];
@@ -511,6 +517,72 @@ try {
   r = await tok.callTool({ name: 'pulse_whoami', arguments: {} });
   check('jeton d’accès seul : authentification OK', !r.isError && textOf(r).includes('Assistant'), textOf(r));
   await tok.close();
+
+  // Identité par session OpenCode : deux utilisateurs partagent le processus.
+  const sessionDir = path.join(tmp, 'echo-sessions');
+  fs.mkdirSync(sessionDir, { recursive: true });
+  delegatedToken = 'pulse_delegated_test';
+  validApiTokens.add(delegatedToken);
+  const boundSession = 'ses_delegated';
+  fs.writeFileSync(
+    path.join(sessionDir, `${boundSession}.json`),
+    JSON.stringify({ token: delegatedToken, apiUrl }),
+  );
+  fs.writeFileSync(
+    path.join(sessionDir, 'ses_empty.json'),
+    JSON.stringify({ token: '', apiUrl }),
+  );
+
+  const shared = new Client({ name: 'pulse-mcp-test-sessions', version: '1.0.0' });
+  const sharedTransport = new StdioClientTransport({
+    command: process.execPath,
+    args: [SERVER],
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      PULSE_NO_DOTENV: '1',
+      PULSE_API_URL: apiUrl,
+      PULSE_API_TOKEN: tokenMatch[1],
+      PULSE_SESSION_DIR: sessionDir,
+      PULSE_SESSION_FILE: path.join(tmp, 'shared-session.json'),
+      PULSE_LOGIN: '',
+      PULSE_PASSWORD: '',
+    },
+    stderr: 'pipe',
+  });
+  await shared.connect(sharedTransport);
+
+  r = await shared.callTool({
+    name: 'pulse_whoami',
+    arguments: {},
+    _meta: { 'ai.opencode/sessionID': boundSession },
+  });
+  check(
+    'session liée : compte délégué utilisé',
+    !r.isError && textOf(r).includes('Bob') && !textOf(r).includes('Assistant'),
+    textOf(r),
+  );
+
+  r = await shared.callTool({
+    name: 'pulse_whoami',
+    arguments: {},
+    _meta: { 'ai.opencode/sessionID': 'ses_empty' },
+  });
+  check('session vide : pas de repli sur le compte admin', r.isError === true, textOf(r));
+
+  r = await shared.callTool({
+    name: 'pulse_whoami',
+    arguments: {},
+    _meta: { 'ai.opencode/sessionID': 'ses_unknown' },
+  });
+  check('session inconnue : repli sur le compte admin', !r.isError && textOf(r).includes('Assistant'), textOf(r));
+
+  const { resources } = await shared.listResources();
+  check(
+    'instructions exposées en ressource',
+    resources.some((res) => res.uri === 'pulse://instructions' && res.description?.includes('messagerie privée')),
+  );
+  await shared.close();
 
   console.log(`\n${passed} assertions réussies.`);
 } finally {

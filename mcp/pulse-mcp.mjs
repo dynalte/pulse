@@ -4,6 +4,9 @@
  *
  * Transport : stdio (OpenCode lance ce processus).
  * Auth      : login/mot de passe Pulse, jeton de session mis en cache.
+ *             Un jeton par session OpenCode peut être fourni par Echo via
+ *             PULSE_SESSION_DIR (fichier <sessionID>.json) pour que plusieurs
+ *             utilisateurs Pulse partagent le même serveur MCP.
  *
  * Variables d'environnement (ou fichier mcp/.env, voir mcp/.env.example) :
  *   PULSE_API_URL        URL de l'API (défaut : prod pulse.dynaspirit.com)
@@ -11,6 +14,7 @@
  *   PULSE_PASSWORD       mot de passe
  *   PULSE_API_TOKEN      jeton d'accès personnel (recommandé, généré dans Pulse)
  *   PULSE_SESSION_TOKEN  ancien jeton de session du navigateur (optionnel)
+ *   PULSE_SESSION_DIR    jetons par session OpenCode (défaut /tmp/opencode/pulse-sessions)
  *   PULSE_READ_ONLY=1    n'expose que les outils de lecture
  *   PULSE_DRY_RUN=1      n'écrit rien : renvoie l'appel qui aurait été fait
  *   PULSE_SESSION_FILE   chemin du cache de session (défaut ~/.cache/pulse-mcp)
@@ -22,6 +26,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { fileURLToPath } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -29,6 +34,16 @@ import { z } from 'zod';
 
 const VERSION = '1.0.0';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
+
+const INSTRUCTIONS =
+  'Pulse est une messagerie privée (conversations directes et groupes). ' +
+  'Pour envoyer à un contact par son nom, utilise pulse_send_to ; pour répondre au dernier ' +
+  'message, pulse_reply_last ; pour les non-lus, pulse_unread_summary. ' +
+  'Sinon, commence par pulse_list_conversations pour obtenir les identifiants numériques, ' +
+  'puis pulse_read_messages avec conversationId. Les identifiants (#12) sont ceux des messages. ' +
+  "N'envoie, ne modifie ou ne supprime un message que si l'utilisateur le demande explicitement ; " +
+  "en cas de doute, montre d'abord le message prévu et demande confirmation. " +
+  'Toutes les heures sont en UTC.';
 
 /* ------------------------------------------------------------------ env */
 
@@ -98,6 +113,9 @@ const TIMEOUT_MS = Math.max(1000, Number(envValue('PULSE_TIMEOUT_MS')) || 20000)
 const CACHE_DIR = process.env.XDG_CACHE_HOME || path.join(os.homedir(), '.cache');
 const SESSION_FILE =
   envValue('PULSE_SESSION_FILE') || path.join(CACHE_DIR, 'pulse-mcp', 'session.json');
+const SESSION_DIR =
+  envValue('PULSE_SESSION_DIR') ||
+  path.join(os.tmpdir(), 'opencode', 'pulse-sessions');
 
 /* -------------------------------------------------------------- session */
 
@@ -214,6 +232,71 @@ function currentAuth() {
   return null;
 }
 
+/* ------------------------------------------- identité par session OpenCode */
+
+const requestContext = new AsyncLocalStorage();
+
+function sessionIDFrom(extra) {
+  const id = extra?._meta?.['ai.opencode/sessionID'];
+  return typeof id === 'string' && /^[A-Za-z0-9_-]+$/.test(id) ? id : '';
+}
+
+/** Jeton déposé par Echo pour cette session OpenCode, s'il existe. */
+function sessionBinding(sessionID) {
+  if (!sessionID) return null;
+  const file = path.join(SESSION_DIR, `${sessionID}.json`);
+  const blocked = { token: '', header: 'X-Api-Token', type: 'user' };
+  let raw;
+  try {
+    raw = fs.readFileSync(file, 'utf8');
+  } catch (e) {
+    // Pas de fichier : session hors Echo, le compte admin reste le repli.
+    if (e?.code === 'ENOENT') return null;
+    // Fichier illisible : on ne retombe jamais sur le compte admin.
+    return blocked;
+  }
+  // Le fichier est créé par l'API OpenCode : on resserre les droits au passage.
+  try {
+    fs.chmodSync(file, 0o600);
+  } catch {
+    /* sans importance */
+  }
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    // Écriture en cours ou corrompue : bloquer plutôt que d'usurper l'admin.
+    return blocked;
+  }
+  if (!data || typeof data !== 'object') return blocked;
+  if (data.apiUrl && normalizeApiUrl(data.apiUrl) !== API_URL) return blocked;
+  if (typeof data.token !== 'string') return blocked;
+  // Fichier présent mais vide : la session ne doit PAS retomber sur le compte admin.
+  if (!data.token) return blocked;
+  return {
+    token: data.token,
+    header: data.header === 'X-Session-Token' ? 'X-Session-Token' : 'X-Api-Token',
+    type: 'user',
+  };
+}
+
+function resolveAuth() {
+  const sessionID = sessionIDFrom(requestContext.getStore()?.extra);
+  const binding = sessionBinding(sessionID);
+  if (binding) {
+    if (!binding.token) {
+      throw new PulseError(
+        "Pulse n'est pas connecté pour cette conversation. " +
+          'Connectez-vous dans Echo → Réglages → Compte Pulse.',
+        401,
+        'auth',
+      );
+    }
+    return binding;
+  }
+  return currentAuth();
+}
+
 async function ensureSession(force = false) {
   if (!force && sessionToken) return sessionToken;
   if (!LOGIN || !PASSWORD) {
@@ -248,28 +331,34 @@ const WRITE_ACTIONS = new Set([
 ]);
 
 const CACHE_MS = Math.max(0, Number(envValue('PULSE_MCP_CACHE_MS')) || 3000);
-let convCache = { at: 0, data: null, includeArchived: true };
+const convCache = new Map();
+
+function cacheKey(auth) {
+  return crypto
+    .createHash('sha256')
+    .update(`${API_URL}\n${auth?.token || 'admin'}`)
+    .digest('hex')
+    .slice(0, 16);
+}
 
 function invalidateConvCache() {
-  convCache = { at: 0, data: null, includeArchived: true };
+  convCache.clear();
 }
 
 /** `conversations_list` avec un cache très court, invalidé dès qu'on écrit. */
 async function getConversations(includeArchived = true) {
-  if (
-    convCache.data &&
-    convCache.includeArchived === includeArchived &&
-    Date.now() - convCache.at < CACHE_MS
-  ) {
-    return convCache.data;
+  const key = cacheKey(resolveAuth());
+  const cached = convCache.get(key);
+  if (cached && cached.includeArchived === includeArchived && Date.now() - cached.at < CACHE_MS) {
+    return cached.data;
   }
   const data = await api('conversations_list', { includeArchived });
-  convCache = { at: Date.now(), data, includeArchived };
+  convCache.set(key, { at: Date.now(), data, includeArchived });
   return data;
 }
 
 async function api(action, body = {}) {
-  let auth = currentAuth();
+  let auth = resolveAuth();
   if (!auth) {
     const fresh = await ensureSession();
     auth = { token: fresh, header: 'X-Session-Token', type: 'session' };
@@ -280,6 +369,11 @@ async function api(action, body = {}) {
     return data;
   } catch (e) {
     if (e instanceof PulseError && e.status === 401) {
+      if (auth.type === 'user') {
+        e.message +=
+          ' (jeton Echo expiré ou révoqué : reconnectez-vous dans Echo → Réglages → Compte Pulse)';
+        throw e;
+      }
       if (auth.type === 'api') {
         e.message += ' (jeton révoqué ou expiré ?)';
         throw e;
@@ -487,8 +581,13 @@ function errorResult(e) {
 /** Enveloppe un outil : gestion d'erreurs homogène + dry-run pour les écritures. */
 function tool(handler) {
   return async (args, extra) => {
+    // Un outil sans inputSchema reçoit uniquement `extra` (pas de `args`).
+    const context = extra === undefined ? args : extra;
+    const input = extra === undefined ? {} : args || {};
     try {
-      return await handler(args || {}, extra);
+      // Conserve la session OpenCode de l'appel (métadonnée MCP _meta) pour
+      // choisir le bon compte Pulse, y compris avec des appels concurrents.
+      return await requestContext.run({ extra: context }, () => handler(input, context));
     } catch (e) {
       console.error(`[pulse-mcp] ${e instanceof PulseError ? e.message : e?.stack || e}`);
       return errorResult(e);
@@ -507,17 +606,22 @@ function dryRun(label, action, payload) {
 
 const server = new McpServer(
   { name: 'pulse', version: VERSION },
+  { instructions: INSTRUCTIONS },
+);
+
+// Expose les consignes comme ressource : Echo les affiche dans ses réglages
+// sans avoir à dupliquer le texte. La description porte le texte complet.
+server.registerResource(
+  'instructions',
+  'pulse://instructions',
   {
-    instructions:
-      'Pulse est une messagerie privée (conversations directes et groupes). ' +
-      'Pour envoyer à un contact par son nom, utilise pulse_send_to ; pour répondre au dernier ' +
-      'message, pulse_reply_last ; pour les non-lus, pulse_unread_summary. ' +
-      'Sinon, commence par pulse_list_conversations pour obtenir les identifiants numériques, ' +
-      'puis pulse_read_messages avec conversationId. Les identifiants (#12) sont ceux des messages. ' +
-      "N'envoie, ne modifie ou ne supprime un message que si l'utilisateur le demande explicitement ; " +
-      "en cas de doute, montre d'abord le message prévu et demande confirmation. " +
-      'Toutes les heures sont en UTC.',
+    title: 'Instructions du serveur MCP Pulse',
+    description: INSTRUCTIONS,
+    mimeType: 'text/markdown',
   },
+  async (uri) => ({
+    contents: [{ uri: uri.href, text: INSTRUCTIONS, mimeType: 'text/markdown' }],
+  }),
 );
 
 /* --- lecture : santé / identité ---------------------------------------- */
@@ -1249,6 +1353,7 @@ function describeConfig() {
     `Auth        : ${source}`,
     `Mode        : ${READ_ONLY ? 'lecture seule' : 'lecture + messagerie'}${DRY_RUN ? ' + dry-run' : ''}`,
     `Cache       : ${SESSION_FILE}`,
+    `Sessions    : ${SESSION_DIR}`,
     `Délai       : ${TIMEOUT_MS} ms`,
   ].join('\n');
 }
@@ -1277,8 +1382,8 @@ async function main() {
       'Serveur MCP Pulse (stdio).\n\n' +
         'Usage : node mcp/pulse-mcp.mjs [--check|--help]\n\n' +
         'Variables : PULSE_API_URL, PULSE_API_TOKEN, PULSE_LOGIN, PULSE_PASSWORD,\n' +
-        '            PULSE_SESSION_TOKEN (legacy), PULSE_READ_ONLY=1, PULSE_DRY_RUN=1,\n' +
-        '            PULSE_TIMEOUT_MS, PULSE_SESSION_FILE\n' +
+        '            PULSE_SESSION_TOKEN (legacy), PULSE_SESSION_DIR, PULSE_READ_ONLY=1,\n' +
+        '            PULSE_DRY_RUN=1, PULSE_TIMEOUT_MS, PULSE_SESSION_FILE\n' +
         'Fichier .env supporté : mcp/.env ou ~/.config/pulse-mcp/.env\n',
     );
     return;
@@ -1289,6 +1394,12 @@ async function main() {
   }
 
   const transport = new StdioServerTransport();
+  try {
+    fs.mkdirSync(SESSION_DIR, { recursive: true, mode: 0o700 });
+    fs.chmodSync(SESSION_DIR, 0o700);
+  } catch (e) {
+    console.error(`[pulse-mcp] dossier de sessions non préparé : ${e.message}`);
+  }
   await server.connect(transport);
   console.error(
     `[pulse-mcp] prêt — ${API_URL} — ${LOGIN ? `compte ${LOGIN}` : 'sans identifiants'}` +
